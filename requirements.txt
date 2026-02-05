@@ -1,0 +1,6 @@
+pandas~=3.0.0
+polars
+matplotlib
+seaborn
+numpy
+scikit-learn
