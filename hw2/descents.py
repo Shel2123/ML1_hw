@@ -62,8 +62,9 @@ class BaseDescent(AbstractOptimizer, ABC):
 
         returns: np.ndarray, w_{k+1} - w_k
         """
-        delta = self._update_weights()
         self.iteration += 1
+        delta = self._update_weights()
+
         return delta
 
     def optimize(self) -> None:
