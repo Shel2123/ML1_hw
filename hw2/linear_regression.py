@@ -97,13 +97,17 @@ class L2Regularization(LossFunction):
         # analytic_solution_func is meant to be passed separately,
         # as it is not linear to core solution
 
+    def loss(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
+        core = self.core_loss.loss(X, y, w)
+        penalty = 0.5 * self.mu_rate * float(np.sum(w ** 2))
+        return core + penalty
+
     def gradient(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> np.ndarray:
-        core_part = self.core_loss.gradient(X, y, w)
+        core_grad = self.core_loss.gradient(X, y, w)
+        reg_grad = self.mu_rate * w
+        return core_grad + reg_grad
 
-        penalty_part = ...
 
-        raise NotImplementedError()
-        # TODO: implement
 
 
 class CustomLinearRegression(LinearRegressionInterface):
