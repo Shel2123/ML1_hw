@@ -4,7 +4,7 @@ from descents import AnalyticSolutionOptimizer
 from typing import Dict, Type, Optional, Callable
 from abc import abstractmethod, ABC
 from scipy.sparse.linalg import svds
-from scipy.sparse import issparse
+# from scipy.sparse import issparse
 
 
 class MSELoss(LossFunction, LossFunctionClosedFormMixin):
@@ -81,7 +81,7 @@ class MSELoss(LossFunction, LossFunctionClosedFormMixin):
             tol=0,
             maxiter=None,
         )
-        cut = 1e-8 * max(n, m) * s[0]
+        cut = 1e-8 * max(n, m) * s.max()
 
         s_inv = np.where(s > cut, 1.0 / s, 0.0)
         w = Vt.T @ (s_inv * (U.T @ y))
@@ -97,18 +97,54 @@ class L2Regularization(LossFunction):
         # analytic_solution_func is meant to be passed separately,
         # as it is not linear to core solution
 
-    def loss(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
+    def loss(self, X, y, w):
         core = self.core_loss.loss(X, y, w)
-        penalty = 0.5 * self.mu_rate * float(np.sum(w ** 2))
+        w_reg = w.copy()
+        w_reg[-1] = 0.0
+        penalty = 0.5 * self.mu_rate * float(np.sum(w_reg ** 2))
         return core + penalty
 
-    def gradient(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> np.ndarray:
+    def gradient(self, X, y, w):
         core_grad = self.core_loss.gradient(X, y, w)
-        reg_grad = self.mu_rate * w
-        return core_grad + reg_grad
+        w_reg = w.copy()
+        w_reg[-1] = 0.0
+        return core_grad + self.mu_rate * w_reg
 
 
+class LogCosh(LossFunction):
+    def gradient(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> np.ndarray:
+        n = y.shape[0]
+        r = X @ w - y
+        grad = (1.0 / n) * (X.T @ np.tanh(r))
+        return grad
+    def loss(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
+        n = y.shape[0]
+        r = X @ w - y
+        Q = (1.0 / n) * np.sum(np.log(np.cosh(r)))
+        return float(Q)
 
+class HuberLoss(LossFunction):
+    def __init__(self, delta: float = 1.0):
+        self.delta = delta
+    def gradient(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> np.ndarray:
+        n = y.shape[0]
+        r = X @ w - y
+        abs_r = np.abs(r)
+
+        g = np.where(abs_r < self.delta, r, self.delta * np.sign(r))
+        grad = (1.0 / n) * (X.T @ g)
+        return grad
+
+    def loss(self, X: np.ndarray, y: np.ndarray, w: np.ndarray) -> float:
+        n = y.shape[0]
+        r = X @ w - y
+        abs_r = np.abs(r)
+
+        quad = 0.5 * r ** 2
+        lin = self.delta * abs_r - 0.5 * self.delta ** 2
+
+        Q = (1.0 / n) * np.sum(np.where(abs_r < self.delta, quad, lin))
+        return float(Q)
 
 class CustomLinearRegression(LinearRegressionInterface):
     def __init__(
@@ -131,9 +167,7 @@ class CustomLinearRegression(LinearRegressionInterface):
         """
         returns: np.ndarray, вектор \\hat{y}
         """
-        if self.w is None:
-            raise RuntimeError("Not fitted: w = None")
-        if hasattr(X, "to_numpy") and not issparse(X):
+        if hasattr(X, "to_numpy"):
             X = X.to_numpy()
         return X @ self.w
 
@@ -164,7 +198,7 @@ class CustomLinearRegression(LinearRegressionInterface):
         """
         self.loss_history = []
         self.optimizer.iteration = 0
-        if hasattr(X, "to_numpy") and not issparse(X):
+        if hasattr(X, "to_numpy"):
             X = X.to_numpy()
         if hasattr(y, "to_numpy"):
             y = y.to_numpy()

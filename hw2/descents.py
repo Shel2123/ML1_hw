@@ -62,8 +62,8 @@ class BaseDescent(AbstractOptimizer, ABC):
 
         returns: np.ndarray, w_{k+1} - w_k
         """
-        self.iteration += 1
         delta = self._update_weights()
+        self.iteration += 1
 
         return delta
 
@@ -129,19 +129,16 @@ class SAGDescent(BaseDescent):
 
         if self.grad_memory is None:
             self.grad_memory = np.zeros((num_objects, num_features), dtype=float)
-
-            for i in range(num_objects):
-                self.grad_memory[i] = self.model.compute_gradients(X_train[i:i + 1], y_train[i:i + 1])
-            self.grad_sum = self.grad_memory.mean(axis=0)
+            self.grad_sum = np.zeros(num_features, dtype=float)
 
         # batch_idx = np.random.randint(0, num_objects, size=self.batch_size)
         batch_idx = np.random.choice(num_objects, size=self.batch_size, replace=False)
-        for j in batch_idx:
-            g_old = self.grad_memory[j].copy()
-            g_new = self.model.compute_gradients(X_train[j:j + 1], y_train[j:j + 1])
 
-            self.grad_memory[j] = g_new
-            self.grad_sum += (g_new - g_old) / num_objects
+        g_old = self.grad_memory[batch_idx]
+        g_new = self.model.compute_gradients(X_train[batch_idx], y_train[batch_idx])
+
+        self.grad_memory[batch_idx] = g_new
+        self.grad_sum = self.grad_sum + (g_new - g_old).sum(axis=0) / num_objects
 
         cur_lr = self.lr_schedule.get_lr(self.iteration)
         grad_step = -cur_lr * self.grad_sum
@@ -188,8 +185,9 @@ class Adam(BaseDescent):
         self.m = self.beta1 * self.m + (1 - self.beta1) * cur_grad
         self.v = self.beta2 * self.v + (1 - self.beta2) * np.square(cur_grad)
 
-        m_hat = self.m / (1 - self.beta1 ** (self.iteration + 1))
-        v_hat = self.v / (1 - self.beta2 ** (self.iteration + 1))
+        t = self.iteration + 1
+        m_hat = self.m / (1 - self.beta1 ** t)
+        v_hat = self.v / (1 - self.beta2 ** t)
         grad_step = - cur_lr / (np.sqrt(v_hat) + self.eps) * m_hat
         self.model.w = self.model.w + grad_step
         return grad_step
