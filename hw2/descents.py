@@ -102,7 +102,7 @@ class StochasticGradientDescent(BaseDescent):
 
     def _update_weights(self) -> np.ndarray:
         n = self.model.X_train.shape[0]
-        batch_idx = np.random.randint(0, n, size=self.batch_size)
+        batch_idx = np.random.choice(n, size=self.batch_size, replace=False)
 
         X_batch = self.model.X_train[batch_idx]
         y_batch = self.model.y_train[batch_idx]
@@ -190,7 +190,7 @@ class Adam(BaseDescent):
         m_hat = self.m / (1 - self.beta1 ** t)
         v_hat = self.v / (1 - self.beta2 ** t)
         grad_step = - cur_lr / (np.sqrt(v_hat) + self.eps) * m_hat
-        self.model.w = self.model.w + grad_step
+        self.model.w += grad_step
         return grad_step
 
 
