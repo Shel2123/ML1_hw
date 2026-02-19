@@ -131,18 +131,19 @@ class SAGDescent(BaseDescent):
             self.grad_memory = np.zeros((num_objects, num_features), dtype=float)
             self.grad_sum = np.zeros(num_features, dtype=float)
 
-        # batch_idx = np.random.randint(0, num_objects, size=self.batch_size)
         batch_idx = np.random.choice(num_objects, size=self.batch_size, replace=False)
 
-        g_old = self.grad_memory[batch_idx]
-        g_new = self.model.compute_gradients(X_train[batch_idx], y_train[batch_idx])
+        for j in batch_idx:
+            g_new_j = self.model.compute_gradients(X_train[j:j + 1], y_train[j:j + 1])
+            g_old_j = self.grad_memory[j]
 
-        self.grad_memory[batch_idx] = g_new
-        self.grad_sum = self.grad_sum + (g_new - g_old).sum(axis=0) / num_objects
+            self.grad_memory[j] = g_new_j
+            self.grad_sum = self.grad_sum + (g_new_j - g_old_j) / num_objects
 
         cur_lr = self.lr_schedule.get_lr(self.iteration)
         grad_step = -cur_lr * self.grad_sum
         self.model.w = self.model.w + grad_step
+
         return grad_step
 
 
