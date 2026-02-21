@@ -4,7 +4,6 @@ from descents import AnalyticSolutionOptimizer
 from typing import Dict, Type, Optional, Callable
 from abc import abstractmethod, ABC
 from scipy.sparse.linalg import svds
-# from scipy.sparse import issparse
 
 
 class MSELoss(LossFunction, LossFunctionClosedFormMixin):
