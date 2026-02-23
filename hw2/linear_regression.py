@@ -168,6 +168,7 @@ class CustomLinearRegression(LinearRegressionInterface):
         """
         if hasattr(X, "to_numpy"):
             X = X.to_numpy()
+        X = np.asarray(X, dtype=float)
         return X @ self.w
 
     def compute_gradients(self, X_batch: np.ndarray | None = None, y_batch: np.ndarray | None = None) -> np.ndarray:
@@ -201,8 +202,7 @@ class CustomLinearRegression(LinearRegressionInterface):
             X = X.to_numpy()
         if hasattr(y, "to_numpy"):
             y = y.to_numpy()
-        y = np.asarray(y).reshape(-1)
-        self.X_train = X
-        self.y_train = y
+        self.X_train = np.asarray(X, dtype=float)
+        self.y_train = np.asarray(y, dtype=float).reshape(-1)
         self.w = np.zeros(X.shape[1], dtype=float)
         self.optimizer.optimize()

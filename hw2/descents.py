@@ -71,8 +71,8 @@ class BaseDescent(AbstractOptimizer, ABC):
         """
         Оркестрирует весь алгоритм градиентного спуска.
         """
-        self.model.loss_history.append(self.model.compute_loss())
-        for epoch in range(self.max_iter):
+        self.model.loss_history = [self.model.compute_loss()]
+        for _ in range(self.max_iter):
             d = self._step()
             loss = self.model.compute_loss()
             self.model.loss_history.append(loss)
@@ -86,10 +86,8 @@ class BaseDescent(AbstractOptimizer, ABC):
 # ===== Specific Optimizers =====
 class VanillaGradientDescent(BaseDescent):
     def _update_weights(self) -> np.ndarray:
-        X_train = self.model.X_train
-        y_train = self.model.y_train
         cur_lr = self.lr_schedule.get_lr(self.iteration)
-        cur_grad = self.model.compute_gradients(X_train, y_train)
+        cur_grad = self.model.compute_gradients()
         grad_step = -cur_lr * cur_grad
         self.model.w = self.model.w + grad_step
         return grad_step
@@ -156,7 +154,7 @@ class MomentumDescent(BaseDescent):
         if self.velocity is None:
             self.velocity = np.zeros_like(self.model.w)
         cur_lr = self.lr_schedule.get_lr(self.iteration)
-        cur_grad = self.model.compute_gradients(self.model.X_train, self.model.y_train)
+        cur_grad = self.model.compute_gradients()
 
         self.velocity = self.beta * self.velocity + cur_lr * cur_grad
         self.model.w = self.model.w - self.velocity
@@ -173,13 +171,11 @@ class Adam(BaseDescent):
         self.v = None
 
     def _update_weights(self) -> np.ndarray:
-        X = self.model.X_train
-        y = self.model.y_train
         if self.m is None or self.v is None:
             self.m = np.zeros_like(self.model.w)
             self.v = np.zeros_like(self.model.w)
 
-        cur_grad = self.model.compute_gradients(X, y)
+        cur_grad = self.model.compute_gradients()
         cur_lr = self.lr_schedule.get_lr(self.iteration)
 
         self.m = self.beta1 * self.m + (1 - self.beta1) * cur_grad
