@@ -1,4 +1,4 @@
-import numpy as np
+import cupy as cp
 from abc import ABC, abstractmethod
 from interfaces import LearningRateSchedule, AbstractOptimizer, LinearRegressionInterface
 
@@ -37,17 +37,20 @@ class BaseDescent(AbstractOptimizer, ABC):
     def __init__(self,
                  lr_schedule: LearningRateSchedule = TimeDecayLR(),
                  tolerance: float = 1e-6,
-                 max_iter: int = 1000
+                 max_iter: int = 1000,
+                 check_every: int = 20,
+                 log_every: int = 20
                  ):
-        self.lr_schedule = lr_schedule
-        self.tolerance = tolerance
-        self.max_iter = max_iter
+            self.lr_schedule = lr_schedule
+            self.tolerance = tolerance
+            self.max_iter = max_iter
+            self.iteration = 0
+            self.check_every = check_every
+            self.log_every = log_every
 
-        self.iteration = 0
-        self.model: LinearRegressionInterface = None
-
+            self.model: LinearRegressionInterface = None
     @abstractmethod
-    def _update_weights(self) -> np.ndarray:
+    def _update_weights(self) -> cp.ndarray:
         """
         Вычисляет обновление согласно конкретному алгоритму и обновляет веса модели, перезаписывая её атрибут.
         Не имеет прямого доступа к вычислению градиента в точке, для подсчета вызывает model.compute_gradients.
@@ -56,11 +59,11 @@ class BaseDescent(AbstractOptimizer, ABC):
         """
         pass
 
-    def _step(self) -> np.ndarray:
+    def _step(self) -> cp.ndarray:
         """
         Проводит один полный шаг интеративного алгоритма градиентного спуска
 
-        returns: np.ndarray, w_{k+1} - w_k
+        returns: cp.ndarray, w_{k+1} - w_k
         """
         delta = self._update_weights()
         self.iteration += 1
@@ -71,25 +74,30 @@ class BaseDescent(AbstractOptimizer, ABC):
         """
         Оркестрирует весь алгоритм градиентного спуска.
         """
-        self.model.loss_history = [self.model.compute_loss()]
-        for _ in range(self.max_iter):
+        self.model.loss_history = []
+        self.model.loss_history.append(self.model.compute_loss())
+
+        for k in range(self.max_iter):
             d = self._step()
-            loss = self.model.compute_loss()
-            self.model.loss_history.append(loss)
-            if np.isnan(d).any():
-                print("Nan in delta")
-                break
-            if np.sum(np.square(d)) < self.tolerance:
-                break
+
+            if (k % self.check_every) == 0:
+                if bool(cp.isnan(d).any()):
+                    print("Nan in delta")
+                    break
+                if float(cp.sum(d * d)) < self.tolerance:
+                    break
+
+            if (k % self.log_every) == 0:
+                self.model.loss_history.append(self.model.compute_loss())
 
 
 # ===== Specific Optimizers =====
 class VanillaGradientDescent(BaseDescent):
-    def _update_weights(self) -> np.ndarray:
+    def _update_weights(self) -> cp.ndarray:
         cur_lr = self.lr_schedule.get_lr(self.iteration)
         cur_grad = self.model.compute_gradients()
         grad_step = -cur_lr * cur_grad
-        self.model.w = self.model.w + grad_step
+        self.model.w += grad_step
         return grad_step
 
 
@@ -98,9 +106,9 @@ class StochasticGradientDescent(BaseDescent):
         super().__init__(*args, **kwargs)
         self.batch_size = batch_size
 
-    def _update_weights(self) -> np.ndarray:
+    def _update_weights(self) -> cp.ndarray:
         n = self.model.X_train.shape[0]
-        batch_idx = np.random.choice(n, size=self.batch_size, replace=False)
+        batch_idx = cp.random.randint(0, n, size=self.batch_size)
 
         X_batch = self.model.X_train[batch_idx]
         y_batch = self.model.y_train[batch_idx]
@@ -109,7 +117,7 @@ class StochasticGradientDescent(BaseDescent):
         cur_lr = self.lr_schedule.get_lr(self.iteration)
         grad_step = -cur_lr * batch_grad
 
-        self.model.w = self.model.w + grad_step
+        self.model.w += grad_step
         return grad_step
 
 
@@ -120,26 +128,25 @@ class SAGDescent(BaseDescent):
         self.grad_sum = None
         self.batch_size = batch_size
 
-    def _update_weights(self) -> np.ndarray:
+    def _update_weights(self):
         X_train = self.model.X_train
         y_train = self.model.y_train
-        num_objects, num_features = X_train.shape
+        n, _ = X_train.shape
 
         if self.grad_memory is None:
-            self.grad_memory = np.zeros((num_objects,) + self.model.w.shape, dtype=float)
-            self.grad_sum = np.zeros_like(self.model.w, dtype=float)
+            self.grad_memory = cp.zeros((n,) + self.model.w.shape, dtype=self.model.w.dtype)
+            self.grad_mean = cp.zeros_like(self.model.w)
 
-        batch_idx = np.random.choice(num_objects, size=self.batch_size, replace=False)
+        batch_idx = cp.random.choice(n, size=self.batch_size, replace=False)
 
-        for j in batch_idx:
-            g_old = self.grad_memory[j].copy()
-            g_new = self.model.compute_gradients(X_train[j:j + 1], y_train[j:j + 1])
+        g_old = self.grad_memory[batch_idx]
+        g_new = self.model.compute_gradients(X_train[batch_idx], y_train[batch_idx])
 
-            self.grad_memory[j] = g_new
-            self.grad_sum += (g_new - g_old) / num_objects
+        self.grad_memory[batch_idx] = g_new
+        self.grad_mean = self.grad_mean + (g_new - g_old).sum(axis=0) / n
 
         cur_lr = self.lr_schedule.get_lr(self.iteration)
-        grad_step = -cur_lr * self.grad_sum
+        grad_step = -cur_lr * self.grad_mean
         self.model.w += grad_step
         return grad_step
 
@@ -150,14 +157,14 @@ class MomentumDescent(BaseDescent):
         self.beta = beta
         self.velocity = None
 
-    def _update_weights(self) -> np.ndarray:
+    def _update_weights(self) -> cp.ndarray:
         if self.velocity is None:
-            self.velocity = np.zeros_like(self.model.w)
+            self.velocity = cp.zeros_like(self.model.w)
         cur_lr = self.lr_schedule.get_lr(self.iteration)
         cur_grad = self.model.compute_gradients()
 
         self.velocity = self.beta * self.velocity + cur_lr * cur_grad
-        self.model.w = self.model.w - self.velocity
+        self.model.w -= self.velocity
         return -self.velocity
 
 
@@ -170,21 +177,21 @@ class Adam(BaseDescent):
         self.m = None
         self.v = None
 
-    def _update_weights(self) -> np.ndarray:
+    def _update_weights(self) -> cp.ndarray:
         if self.m is None or self.v is None:
-            self.m = np.zeros_like(self.model.w)
-            self.v = np.zeros_like(self.model.w)
+            self.m = cp.zeros_like(self.model.w)
+            self.v = cp.zeros_like(self.model.w)
 
         cur_grad = self.model.compute_gradients()
         cur_lr = self.lr_schedule.get_lr(self.iteration)
 
         self.m = self.beta1 * self.m + (1 - self.beta1) * cur_grad
-        self.v = self.beta2 * self.v + (1 - self.beta2) * np.square(cur_grad)
+        self.v = self.beta2 * self.v + (1 - self.beta2) * cp.square(cur_grad)
 
         t = self.iteration + 1
         m_hat = self.m / (1 - self.beta1 ** t)
         v_hat = self.v / (1 - self.beta2 ** t)
-        grad_step = - cur_lr / (np.sqrt(v_hat) + self.eps) * m_hat
+        grad_step = - cur_lr / (cp.sqrt(v_hat) + self.eps) * m_hat
         self.model.w += grad_step
         return grad_step
 
