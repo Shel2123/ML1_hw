@@ -1,37 +1,100 @@
+import json
+import os
+import warnings
+from datetime import datetime
+
 import numpy as np
-from sklearn.metrics import roc_auc_score
-import category_encoders as ce
 import pandas as pd
+import category_encoders as ce
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.base import clone
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+from cuml.linear_model import LogisticRegression as cuLogisticRegression
 
 
-def gini(y_true, y_score):
-    return 2 * roc_auc_score(y_true, y_score) - 1.0
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*No categorical columns found.*")
 
-def align_to_train_columns(df, train_columns):
-    df = df.copy()
+results_store = []
 
-    for col in train_columns:
-        if col not in df.columns:
-            df[col] = np.nan
 
-    return df[train_columns]
+def to_pandas_df(df):
+    if isinstance(df, pd.DataFrame):
+        return df.copy()
+    if hasattr(df, "to_pandas"):
+        return df.to_pandas().copy()
+    return pd.DataFrame(df).copy()
 
-def make_month_weekend_features(df):
-    df = df.copy()
+
+def to_numpy(x):
+    if isinstance(x, pd.DataFrame):
+        return x.to_numpy()
+    if isinstance(x, pd.Series):
+        return x.to_numpy()
+
+    mod = type(x).__module__
+
+    if mod.startswith("cupy"):
+        return x.get()
+
+    if mod.startswith("cudf"):
+        return x.to_pandas().to_numpy()
+
+    return np.asarray(x)
+
+
+def unique_list(values):
+    return list(dict.fromkeys(values))
+
+def clone_config(cfg):
+    return {
+        "target_cols": list(cfg.get("target_cols", [])),
+        "ohe_cols": list(cfg.get("ohe_cols", [])),
+        "numeric_cols": list(cfg.get("numeric_cols", [])),
+        "mmr_transform": cfg.get("mmr_transform", "raw"),
+    }
+
+def add_mmr_to_config(base_cfg, mmr_transform="raw"):
+    cfg = clone_config(base_cfg)
+    cfg["numeric_cols"] = unique_list(cfg["numeric_cols"] + ["avg_mmr", "mmr_missing"])
+    cfg["mmr_transform"] = mmr_transform
+    return cfg
+
+
+def make_submission_path(base_path, suffix):
+    root, ext = os.path.splitext(base_path)
+    if not ext:
+        ext = ".csv"
+    return f"{root}_{suffix}{ext}"
+
+
+
+def gini_score(y_true, y_score):
+    y_true = to_numpy(y_true).reshape(-1)
+    y_score = to_numpy(y_score).reshape(-1)
+    return 2.0 * roc_auc_score(y_true, y_score) - 1.0
+
+
+def extract_date_features(df):
     df["date"] = pd.to_datetime(df["date"])
-    df["weekday"] = df["date"].dt.weekday
-    df["month"] = df["date"].dt.month
-    df["is_weekend"] = (df["weekday"] >= 5).astype(int)
-    df.drop(columns=["weekday"], inplace=True)
+
+    # df["day"] = df["date"].dt.day.astype(str)
+    # df["weekday"] = df["date"].dt.weekday.astype(str)
+    df["month"] = df["date"].dt.month.astype(str)
+    df["is_weekend"] = (df["date"].dt.weekday >= 5).astype(str)
+
     return df
 
-def fit_mmr_fill(df_train: pd.DataFrame):
-    group_means = df_train.groupby(["region", "game_mode"])["avg_mmr"].mean()
-    region_means = df_train.groupby("region")["avg_mmr"].mean()
-    global_mean = df_train["avg_mmr"].mean()
+
+def fit_mmr_fill_stats(df):
+    group_means = df.groupby(["region", "game_mode"])["avg_mmr"].mean()
+    region_means = df.groupby("region")["avg_mmr"].mean()
+    global_mean = df["avg_mmr"].mean()
 
     return {
         "group_means": group_means,
@@ -40,175 +103,401 @@ def fit_mmr_fill(df_train: pd.DataFrame):
     }
 
 
-def transform_mmr_fill(df, mmr_stats):
-    df = df.copy()
+def transform_mmr_fill(df, stats):
+    if "avg_mmr" not in df.columns:
+        return df
 
-    idx = pd.MultiIndex.from_frame(df[["region", "game_mode"]])
-    df["avg_mmr"] = df["avg_mmr"].fillna(
-        pd.Series(idx.map(mmr_stats["group_means"]), index=df.index)
-    )
-    df["avg_mmr"] = df["avg_mmr"].fillna(df["region"].map(mmr_stats["region_means"]))
-    df["avg_mmr"] = df["avg_mmr"].fillna(mmr_stats["global_mean"])
+    df["mmr_missing"] = df["avg_mmr"].isna().astype(int)
+
+    if "region" in df.columns and "game_mode" in df.columns:
+        pair_index = pd.MultiIndex.from_frame(df[["region", "game_mode"]])
+        pair_fill = pd.Series(pair_index.map(stats["group_means"]), index=df.index)
+
+        df["avg_mmr"] = df["avg_mmr"].fillna(pair_fill)
+        df["avg_mmr"] = df["avg_mmr"].fillna(df["region"].map(stats["region_means"]))
+        df["avg_mmr"] = df["avg_mmr"].fillna(stats["global_mean"])
+    else:
+        df["avg_mmr"] = df["avg_mmr"].fillna(stats["global_mean"])
 
     return df
 
-def fit_encoder(df_train, region_features=True, date_features=True):
-    cols = []
 
-    if date_features:
-        cols.append("month")
-
-    if region_features:
-        cols.extend(["region", "game_mode"])
-
-    if not cols:
-        return None
-
-    ohe = ce.OneHotEncoder(
-        cols=cols,
-        use_cat_names=True,
-        handle_unknown="indicator"
-    )
-    ohe.fit(df_train)
-    return ohe
-
-
-def transform_encoder(df, encoder):
-    df = df.copy()
-    if encoder is None:
+def transform_mmr_value(df, mode):
+    if "avg_mmr" not in df.columns:
         return df
-    return encoder.transform(df)
 
+    values = df["avg_mmr"].astype(float).clip(lower=0)
 
-def preprocess_fold(df_train: pd.DataFrame, df_other: pd.DataFrame, region_features=True, date_features=True):
-    df_train = df_train.copy()
-    df_other = df_other.copy()
-
-    df_train = make_month_weekend_features(df_train)
-    df_other = make_month_weekend_features(df_other)
-
-    df_other = align_to_train_columns(df_other, df_train.columns)
-
-    mmr_stats = fit_mmr_fill(df_train)
-    df_train = transform_mmr_fill(df_train, mmr_stats)
-    df_other = transform_mmr_fill(df_other, mmr_stats)
-    # print(df_train.head())
-    # print(f"Nans for train: {df_train.isna().sum().sum()}")
-    # print(df_other.head())
-    # print(f"Nans for other: {df_other.isna().sum().sum()}")
-
-    encoder = fit_encoder(
-        df_train,
-        region_features=region_features,
-        date_features=date_features
-    )
-
-    df_train = transform_encoder(df_train, encoder)
-    df_other = transform_encoder(df_other, encoder)
-
-    df_train = df_train.drop(columns=["date", "duration", "match_id"], errors="ignore")
-    df_other = df_other.drop(columns=["date", "duration", "match_id", "radiant_win"], errors="ignore")
-    # print("========= AFTER PREPROCESS (without scaler) ==========")
-    # print(df_train.head())
-    # print(f"Nans for train: {df_train.isna().sum().sum()}")
-    # print(df_other.head())
-    # print(f"Nans for other: {df_other.isna().sum().sum()}")
-    return df_train, df_other
-
-def get_model_scores(model, X):
-    if hasattr(model, "predict_proba"):
-        return model.predict_proba(X)[:, 1]
-    elif hasattr(model, "decision_function"):
-        return model.decision_function(X)
+    if mode is None or mode == "raw":
+        df["avg_mmr"] = values
+    elif mode == "log1p":
+        df["avg_mmr"] = np.log1p(values)
+    elif mode == "sqrt":
+        df["avg_mmr"] = np.sqrt(values)
     else:
-        raise ValueError(
-            f"{type(model).__name__} does not support predict_proba or decision_function"
+        raise ValueError(f"Unknown mmr transform: {mode}")
+
+    return df
+
+
+def preprocess_fold(train_df, other_df, mmr_transform="raw"):
+    train_df = to_pandas_df(train_df)
+    other_df = to_pandas_df(other_df)
+
+    train_df = extract_date_features(train_df)
+    other_df = extract_date_features(other_df)
+
+    if {"avg_mmr", "region", "game_mode"}.issubset(train_df.columns):
+        mmr_stats = fit_mmr_fill_stats(train_df)
+        train_df = transform_mmr_fill(train_df, mmr_stats)
+        other_df = transform_mmr_fill(other_df, mmr_stats)
+
+    train_df = transform_mmr_value(train_df, mmr_transform)
+    other_df = transform_mmr_value(other_df, mmr_transform)
+
+    return train_df, other_df
+
+
+def make_preprocessor(target_cols, ohe_cols, numeric_cols):
+    transformers = []
+
+    if target_cols:
+        transformers.append(
+            (
+                "target_enc",
+                ce.TargetEncoder(
+                    cols=target_cols,
+                    handle_unknown="value",
+                    handle_missing="value",
+                    return_df=False,
+                ),
+                target_cols,
+            )
         )
 
-def inspect_pipeline_transform(fitted_model, X):
-    Xt = fitted_model.named_steps["preprocessor"].transform(X)
-    cols = fitted_model.named_steps["preprocessor"].get_feature_names_out()
-    return pd.DataFrame(Xt, columns=cols, index=X.index)
+    if ohe_cols:
+        transformers.append(
+            (
+                "ohe",
+                ce.OneHotEncoder(
+                    cols=ohe_cols,
+                    handle_unknown="indicator",
+                    handle_missing="indicator",
+                    use_cat_names=True,
+                    return_df=False,
+                ),
+                ohe_cols,
+            )
+        )
+
+    if numeric_cols:
+        transformers.append(
+            (
+                "num",
+                Pipeline([
+                    ("imputer", SimpleImputer(strategy="median")),
+                    ("scaler", StandardScaler()),
+                ]),
+                numeric_cols,
+            )
+        )
+
+    return ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+    )
 
 
-def start_preds(df_train_raw: pd.DataFrame, model: Pipeline, n_splits=5, target_col="radiant_win",
-                region_features=True, date_features=True):
+def make_pipeline(target_cols, ohe_cols, numeric_cols):
+    return Pipeline([
+        ("prep", make_preprocessor(target_cols, ohe_cols, numeric_cols)),
+        ("clf", cuLogisticRegression(max_iter=1000, C=1.0)),
+    ])
 
-    df_train_raw = df_train_raw.copy()
-    df_train_raw["date"] = pd.to_datetime(df_train_raw["date"])
-    df_train_raw = df_train_raw.sort_values("date").reset_index(drop=True)
+
+def get_positive_class_proba(model, X):
+    proba = model.predict_proba(X)
+
+    if isinstance(proba, pd.DataFrame):
+        if proba.shape[1] == 1:
+            return proba.iloc[:, 0].to_numpy(dtype=float)
+        return proba.iloc[:, 1].to_numpy(dtype=float)
+
+    if isinstance(proba, pd.Series):
+        return proba.to_numpy(dtype=float)
+
+    arr = to_numpy(proba)
+
+    if arr.ndim == 1:
+        return arr.astype(float)
+
+    return arr[:, 1].astype(float)
+
+
+def prepare_model_data(df, feature_cols, target_col="radiant_win"):
+    X = df.reindex(columns=feature_cols)
+
+    if target_col in df.columns:
+        y = df[target_col].astype(int).copy()
+        return X, y
+
+    return X, None
+
+
+def cross_validate_model(
+    df_train,
+    target_cols,
+    ohe_cols,
+    numeric_cols,
+    mmr_transform="raw",
+    n_splits=5,
+    target_col="radiant_win",
+):
+    df_train = to_pandas_df(df_train)
+    df_train["date"] = pd.to_datetime(df_train["date"])
+    df_train = df_train.sort_values("date").reset_index(drop=True)
 
     tscv = TimeSeriesSplit(n_splits=n_splits)
 
-    fold_scores = []
-    oof_pred = np.zeros(len(df_train_raw))
+    fold_ginis = []
 
-    for fold, (train_idx, val_idx) in enumerate(tscv.split(df_train_raw), start=1):
-        train_fold_raw = df_train_raw.iloc[train_idx].copy()
-        val_fold_raw = df_train_raw.iloc[val_idx].copy()
+    feature_cols = target_cols + ohe_cols + numeric_cols
+    feature_cols = list(dict.fromkeys(feature_cols))
 
-        y_train_fold = train_fold_raw[target_col].copy()
-        y_val_fold = val_fold_raw[target_col].copy()
+    for fold, (train_idx, valid_idx) in enumerate(tscv.split(df_train), start=1):
+        train_fold = df_train.iloc[train_idx]
+        valid_fold = df_train.iloc[valid_idx]
 
-        X_train_fold, X_val_fold = preprocess_fold(
-            train_fold_raw,
-            val_fold_raw,
-            region_features=region_features,
-            date_features=date_features
+        train_fold, valid_fold = preprocess_fold(
+            train_fold,
+            valid_fold,
+            mmr_transform=mmr_transform,
         )
 
-        X_train_fold = X_train_fold.drop(columns=[target_col], errors="ignore")
-        X_val_fold = X_val_fold.drop(columns=[target_col], errors="ignore")
+        X_train, y_train = prepare_model_data(
+            train_fold,
+            feature_cols=feature_cols,
+            target_col=target_col,
+        )
+        X_valid, y_valid = prepare_model_data(
+            valid_fold,
+            feature_cols=feature_cols,
+            target_col=target_col,
+        )
 
-        current_model: Pipeline = clone(model)
-        current_model.fit(X_train_fold, y_train_fold)
-        # debug_df = inspect_pipeline_transform(current_model, X_train_fold)
-        # debug_df.to_csv("debug.csv")
-        val_pred = get_model_scores(current_model, X_val_fold)
+        model = make_pipeline(
+            target_cols=target_cols,
+            ohe_cols=ohe_cols,
+            numeric_cols=numeric_cols,
+        )
+        model.fit(X_train, y_train)
 
-        fold_gini = gini(y_val_fold, val_pred)
-        fold_scores.append(fold_gini)
-        oof_pred[val_idx] = val_pred
+        valid_pred = get_positive_class_proba(model, X_valid)
 
-        print(f"Fold {fold}: Gini = {fold_gini:.5f}")
+        fold_gini = float(gini_score(y_valid, valid_pred))
+        fold_ginis.append(fold_gini)
 
-    return fold_scores, oof_pred
+        print(f"  fold {fold}: Gini = {fold_gini:.5f}")
+
+    mean_gini = float(np.mean(fold_ginis))
+    print(f"  mean Gini = {mean_gini:.5f}")
+
+    return mean_gini, fold_ginis
 
 
-def run_pipeline(df_train: pd.DataFrame, df_test: pd.DataFrame, model: Pipeline, n_splits=5,
-                 region_features: bool = True, date_features: bool = True,
-                 target_col: str = "radiant_win"):
-    scores, oof_pred = start_preds(
-        df_train_raw=df_train,
-        model=model,
-        n_splits=n_splits,
-        target_col=target_col,
-        region_features=region_features,
-        date_features=date_features
-    )
+def fit_full_model_and_predict(
+    df_train,
+    df_test,
+    target_cols,
+    ohe_cols,
+    numeric_cols,
+    mmr_transform="raw",
+    target_col="radiant_win",
+):
+    df_train = to_pandas_df(df_train)
+    df_test = to_pandas_df(df_test)
 
-    print("Mean Gini:", np.mean(scores))
+    df_train["date"] = pd.to_datetime(df_train["date"])
+    df_test["date"] = pd.to_datetime(df_test["date"])
 
-    df_train_sorted = df_train.copy()
-    df_train_sorted["date"] = pd.to_datetime(df_train_sorted["date"])
-    df_train_sorted = df_train_sorted.sort_values("date").reset_index(drop=True)
+    df_train = df_train.sort_values("date").reset_index(drop=True)
 
-    y = df_train_sorted[target_col].copy()
-
-    X_train_full, X_test = preprocess_fold(
-        df_train_sorted,
+    df_train_prep, df_test_prep = preprocess_fold(
+        df_train,
         df_test,
-        region_features=region_features,
-        date_features=date_features
+        mmr_transform=mmr_transform,
     )
 
-    X_train_full = X_train_full.drop(columns=[target_col], errors="ignore")
+    feature_cols = target_cols + ohe_cols + numeric_cols
+    feature_cols = list(dict.fromkeys(feature_cols))
 
-    final_model = clone(model)
-    final_model.fit(X_train_full, y)
+    X_train, y_train = prepare_model_data(
+        df_train_prep,
+        feature_cols=feature_cols,
+        target_col=target_col,
+    )
+    X_test, _ = prepare_model_data(
+        df_test_prep,
+        feature_cols=feature_cols,
+        target_col=target_col,
+    )
 
-    test_pred = get_model_scores(final_model, X_test)
+    model = make_pipeline(
+        target_cols=target_cols,
+        ohe_cols=ohe_cols,
+        numeric_cols=numeric_cols,
+    )
+    model.fit(X_train, y_train)
 
-    return scores, oof_pred, test_pred, final_model
+    test_pred = get_positive_class_proba(model, X_test)
+
+    return model, test_pred
 
 
+def save_test_predictions(df_test, test_pred, path="submission.csv", id_col="match_id"):
+    df_test = to_pandas_df(df_test)
+    test_pred = to_numpy(test_pred).reshape(-1).astype(float)
+
+    if len(df_test) != len(test_pred):
+        raise ValueError(
+            f"Length mismatch: len(df_test)={len(df_test)} != len(test_pred)={len(test_pred)}"
+        )
+
+    if id_col in df_test.columns:
+        ids = df_test[id_col].to_numpy()
+    else:
+        ids = df_test.index.to_numpy()
+
+    submission = pd.DataFrame({
+        "ID": ids,
+        "Value": test_pred,
+    })
+
+    submission.to_csv(path, index=False)
+    print(f"Saved submission: {path}")
+
+    return submission
+
+
+def run(
+    df_train,
+    df_test,
+    n_splits=5,
+    results_path="results.json",
+    submission_path="submission.csv",
+    submission_id_col="match_id",
+    target_col="radiant_win",
+):
+    global results_store
+    results_store = []
+
+    date_cols = ["month", "is_weekend"]
+
+    configs = {
+        "dates": {
+            "target_cols": [],
+            "ohe_cols": date_cols,
+            "numeric_cols": [],
+            "mmr_transform": "raw",
+        },
+        "regions target encoding": {
+            "target_cols": ["region"],
+            "ohe_cols": [],
+            "numeric_cols": [],
+            "mmr_transform": "raw",
+        },
+        "regions OHE": {
+            "target_cols": [],
+            "ohe_cols": ["region"],
+            "numeric_cols": [],
+            "mmr_transform": "raw",
+        },
+        "dates+regions": {
+            "target_cols": [],
+            "ohe_cols":  ["region"] + date_cols,
+            "numeric_cols": [],
+            "mmr_transform": "raw",
+        },
+        "all (raw mmr)": {
+            "target_cols": [],
+            "ohe_cols": ["game_mode", "region"] + date_cols,
+            "numeric_cols": ["avg_mmr", "mmr_missing", "duration"],
+            "mmr_transform": "raw",
+        },
+        "all (sqrt mmr)": {
+            "target_cols": [],
+            "ohe_cols": ["game_mode", "region"] + date_cols,
+            "numeric_cols": ["avg_mmr", "mmr_missing", "duration"],
+            "mmr_transform": "sqrt",
+        },
+    }
+
+    best_name = None
+    best_cfg = None
+    best_gini = -np.inf
+    best_fold_ginis = None
+
+    for config_name, cfg in configs.items():
+        print(f"\n{config_name}")
+
+        mean_gini, fold_ginis = cross_validate_model(
+            df_train=df_train,
+            target_cols=cfg["target_cols"],
+            ohe_cols=cfg["ohe_cols"],
+            numeric_cols=cfg["numeric_cols"],
+            mmr_transform=cfg["mmr_transform"],
+            n_splits=n_splits,
+            target_col=target_col,
+        )
+
+        results_store.append({
+            "timestamp": datetime.now().isoformat(),
+            "model": "cuML LogisticRegression",
+            "features": config_name,
+            "target_cols": cfg["target_cols"],
+            "ohe_cols": cfg["ohe_cols"],
+            "numeric_cols": cfg["numeric_cols"],
+            "mmr_transform": cfg["mmr_transform"],
+            "fold_ginis": [round(x, 6) for x in fold_ginis],
+            "gini": round(mean_gini, 6),
+        })
+
+        if mean_gini > best_gini:
+            best_gini = mean_gini
+            best_name = config_name
+            best_cfg = cfg.copy()
+            best_fold_ginis = fold_ginis
+
+    print(f"\nBest config: {best_name}")
+    print(f"Best mean Gini: {best_gini:.5f}")
+
+    final_model, test_pred = fit_full_model_and_predict(
+        df_train=df_train,
+        df_test=df_test,
+        target_cols=best_cfg["target_cols"],
+        ohe_cols=best_cfg["ohe_cols"],
+        numeric_cols=best_cfg["numeric_cols"],
+        mmr_transform=best_cfg["mmr_transform"],
+        target_col=target_col,
+    )
+
+    submission = save_test_predictions(
+        df_test=df_test,
+        test_pred=test_pred,
+        path=submission_path,
+        id_col=submission_id_col,
+    )
+
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results_store, f, indent=2, ensure_ascii=False)
+
+    return {
+        "best_model": final_model,
+        "best_config": best_name,
+        "best_params": best_cfg,
+        "best_gini": best_gini,
+        "best_fold_ginis": best_fold_ginis,
+        "test_pred": test_pred,
+        "submission": submission,
+        "cv_results": pd.DataFrame(results_store),
+    }
