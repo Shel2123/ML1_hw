@@ -9,3 +9,4 @@ tqdm
 cuml
 cudf
 category-encoders
+optuna
