@@ -1,6 +1,7 @@
 import json
 import os
 import warnings
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import numpy as np
@@ -22,8 +23,32 @@ from heroes_encoder import HeroesEncoder
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*No categorical columns found.*")
 
-results_store = []
 
+@dataclass(frozen=True)
+class FeatureConfig:
+    target_cols: tuple[str, ...] = ()
+    ohe_cols: tuple[str, ...] = ()
+    numeric_cols: tuple[str, ...] = ()
+    mmr_transform: str = "raw"
+
+    @property
+    def feature_cols(self):
+        return list(dict.fromkeys((
+            *self.target_cols,
+            *self.ohe_cols,
+            *self.numeric_cols,
+        )))
+
+    def with_mmr(self, transform="raw"):
+        return replace(
+            self,
+            numeric_cols=tuple(dict.fromkeys((
+                *self.numeric_cols,
+                "avg_mmr",
+                "mmr_missing",
+            ))),
+            mmr_transform=transform,
+        )
 
 def to_pandas_df(df):
     if isinstance(df, pd.DataFrame):
@@ -98,7 +123,6 @@ def preprocess_players_df(players_df):
         players_pl = players_pl.filter(pl.col("account_id") != -1)
     required_cols = [col for col in ("match_id", "hero_id", "player_slot") if col in players_pl.columns]
     if required_cols:
-        # Only drop nulls in hero-related columns; stats are missing in test.
         players_pl = players_pl.drop_nulls(subset=required_cols)
 
     bad_matches = (
@@ -141,30 +165,28 @@ def split_players_by_matches(player_df, matches_train_df, matches_test_df):
     return players_train_df, players_test_df
 
 
-def fit_tabular_feature_blocks(train_matches, other_matches, cfg, target_col="radiant_win"):
+def fit_tabular_feature_blocks(train_matches, other_matches, cfg: FeatureConfig, target_col="radiant_win"):
     train_prep, other_prep = preprocess_fold(
         train_matches,
         other_matches,
-        mmr_transform=cfg["mmr_transform"],
+        mmr_transform=cfg.mmr_transform,
     )
-
-    feature_cols = unique_list(cfg["target_cols"] + cfg["ohe_cols"] + cfg["numeric_cols"])
 
     X_train_tab, y_train = prepare_model_data(
         train_prep,
-        feature_cols=feature_cols,
+        feature_cols=cfg.feature_cols,
         target_col=target_col,
     )
     X_other_tab, y_other = prepare_model_data(
         other_prep,
-        feature_cols=feature_cols,
+        feature_cols=cfg.feature_cols,
         target_col=target_col,
     )
 
     prep = make_preprocessor(
-        target_cols=cfg["target_cols"],
-        ohe_cols=cfg["ohe_cols"],
-        numeric_cols=cfg["numeric_cols"],
+        target_cols=list(cfg.target_cols),
+        ohe_cols=list(cfg.ohe_cols),
+        numeric_cols=list(cfg.numeric_cols),
     )
 
     X_train_block = prep.fit_transform(X_train_tab, y_train)
@@ -172,6 +194,84 @@ def fit_tabular_feature_blocks(train_matches, other_matches, cfg, target_col="ra
 
     return prep, X_train_block, y_train, X_other_block, y_other
 
+
+def make_logreg(model_params=None):
+    model_params = model_params or {}
+    return cuLogisticRegression(
+        penalty="l2",
+        C=model_params.get("C", 1.0),
+        max_iter=model_params.get("max_iter", 2000),
+    )
+
+
+def build_feature_matrices(
+    train_matches,
+    other_matches,
+    cfg: FeatureConfig,
+    *,
+    train_players=None,
+    other_players=None,
+    use_tabular=True,
+    use_heroes=False,
+    heroes_df=None,
+    split_teams=True,
+    target_col="radiant_win",
+):
+    if not use_tabular and not use_heroes:
+        raise ValueError("Нужно включить хотя бы один блок фичей")
+
+    X_train_blocks = []
+    X_other_blocks = []
+
+    y_train = (
+        train_matches[target_col].astype(int).to_numpy()
+        if target_col in train_matches.columns
+        else None
+    )
+    y_other = (
+        other_matches[target_col].astype(int).to_numpy()
+        if target_col in other_matches.columns
+        else None
+    )
+
+    if use_tabular:
+        _, X_train_tab, y_train_tab, X_other_tab, y_other_tab = fit_tabular_feature_blocks(
+            train_matches,
+            other_matches,
+            cfg,
+            target_col=target_col,
+        )
+        X_train_blocks.append(X_train_tab)
+        X_other_blocks.append(X_other_tab)
+
+        if y_train_tab is not None:
+            y_train = to_numpy(y_train_tab).astype(np.int32, copy=False)
+        if y_other_tab is not None:
+            y_other = to_numpy(y_other_tab).astype(np.int32, copy=False)
+
+    if use_heroes:
+        hero_encoder = HeroesEncoder(
+            heroes_df=heroes_df,
+            split_teams=split_teams,
+            dtype=np.int8,
+        )
+
+        X_train_heroes = hero_encoder.fit_transform(
+            train_players,
+            matches_df=train_matches[["match_id"]],
+        )
+        X_other_heroes = hero_encoder.transform(
+            other_players,
+            matches_df=other_matches[["match_id"]],
+        )
+
+        X_train_blocks.append(X_train_heroes)
+        X_other_blocks.append(X_other_heroes)
+
+    X_train = combine_feature_blocks(*X_train_blocks)
+    X_other = combine_feature_blocks(*X_other_blocks)
+
+    return X_train, y_train, X_other, y_other
 
 def as_float32(x):
     if x is None:
@@ -194,32 +294,8 @@ def combine_feature_blocks(*blocks):
     return np.hstack(blocks).astype(np.float32, copy=False)
 
 
-def make_sparse_logreg():
-    return cuLogisticRegression(
-        penalty="l2",
-        C=1.0,
-        max_iter=2000,
-    )
-
-
 def unique_list(values):
     return list(dict.fromkeys(values))
-
-
-def clone_config(cfg):
-    return {
-        "target_cols": list(cfg.get("target_cols", [])),
-        "ohe_cols": list(cfg.get("ohe_cols", [])),
-        "numeric_cols": list(cfg.get("numeric_cols", [])),
-        "mmr_transform": cfg.get("mmr_transform", "raw"),
-    }
-
-
-def add_mmr_to_config(base_cfg, mmr_transform="raw"):
-    cfg = clone_config(base_cfg)
-    cfg["numeric_cols"] = unique_list(cfg["numeric_cols"] + ["avg_mmr", "mmr_missing"])
-    cfg["mmr_transform"] = mmr_transform
-    return cfg
 
 
 def make_submission_path(base_path, suffix):
@@ -365,13 +441,6 @@ def make_preprocessor(target_cols, ohe_cols, numeric_cols):
     )
 
 
-def make_pipeline(target_cols, ohe_cols, numeric_cols):
-    return Pipeline([
-        ("prep", make_preprocessor(target_cols, ohe_cols, numeric_cols)),
-        ("clf", cuLogisticRegression(max_iter=1000, C=1.0)),
-    ])
-
-
 def get_positive_class_proba(model, X):
     proba = model.predict_proba(X)
 
@@ -401,80 +470,25 @@ def prepare_model_data(df, feature_cols, target_col="radiant_win"):
     return X, None
 
 
-def cross_validate_model(
+def cross_validate(
     df_train,
-    target_cols,
-    ohe_cols,
-    numeric_cols,
-    mmr_transform="raw",
-    n_splits=5,
-    target_col="radiant_win",
-):
-    df_train = to_pandas_df(df_train)
-    df_train["date"] = pd.to_datetime(df_train["date"])
-    df_train = df_train.sort_values("date").reset_index(drop=True)
-
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    fold_ginis = []
-
-    feature_cols = unique_list(target_cols + ohe_cols + numeric_cols)
-
-    for fold, (train_idx, valid_idx) in enumerate(tscv.split(df_train), start=1):
-        train_fold = df_train.iloc[train_idx]
-        valid_fold = df_train.iloc[valid_idx]
-
-        train_fold, valid_fold = preprocess_fold(
-            train_fold,
-            valid_fold,
-            mmr_transform=mmr_transform,
-        )
-
-        X_train, y_train = prepare_model_data(
-            train_fold,
-            feature_cols=feature_cols,
-            target_col=target_col,
-        )
-        X_valid, y_valid = prepare_model_data(
-            valid_fold,
-            feature_cols=feature_cols,
-            target_col=target_col,
-        )
-
-        model = make_pipeline(
-            target_cols=target_cols,
-            ohe_cols=ohe_cols,
-            numeric_cols=numeric_cols,
-        )
-        model.fit(X_train, y_train)
-
-        valid_pred = get_positive_class_proba(model, X_valid)
-
-        fold_gini = float(gini_score(y_valid, valid_pred))
-        fold_ginis.append(fold_gini)
-
-        print(f"  fold {fold}: Gini = {fold_gini:.5f}")
-
-    mean_gini = float(np.mean(fold_ginis))
-    print(f"  mean Gini = {mean_gini:.5f}")
-
-    return mean_gini, fold_ginis
-
-def cross_validate_feature_model(
-    df_train,
-    players_train,
-    cfg,
+    cfg: FeatureConfig,
+    *,
+    players_train=None,
     use_tabular=True,
-    use_heroes=True,
+    use_heroes=False,
     heroes_df=None,
     split_teams=True,
     n_splits=5,
     target_col="radiant_win",
+    model_params=None,
 ):
     if not use_tabular and not use_heroes:
         raise ValueError("Нужно включить хотя бы один блок фичей")
 
     df_train = to_pandas_df(df_train)
-    players_train = to_polars_df(players_train)
+    if use_heroes:
+        players_train = to_polars_df(players_train)
 
     df_train["date"] = pd.to_datetime(df_train["date"])
     df_train = df_train.sort_values("date").reset_index(drop=True)
@@ -486,52 +500,33 @@ def cross_validate_feature_model(
         train_matches = df_train.iloc[train_idx].copy()
         valid_matches = df_train.iloc[valid_idx].copy()
 
-        train_players_fold = filter_players_by_match_ids(
-            players_train,
-            train_matches["match_id"].to_numpy(),
-        )
-        valid_players_fold = filter_players_by_match_ids(
-            players_train,
-            valid_matches["match_id"].to_numpy(),
-        )
-
-        X_train_blocks = []
-        X_valid_blocks = []
-
-        if use_tabular:
-            _, X_train_tab, y_train, X_valid_tab, y_valid = fit_tabular_feature_blocks(
-                train_matches,
-                valid_matches,
-                cfg,
-                target_col=target_col,
-            )
-            X_train_blocks.append(X_train_tab)
-            X_valid_blocks.append(X_valid_tab)
-        else:
-            y_train = train_matches[target_col].astype(int).to_numpy()
-            y_valid = valid_matches[target_col].astype(int).to_numpy()
+        train_players_fold = None
+        valid_players_fold = None
 
         if use_heroes:
-            hero_encoder = HeroesEncoder(
-                heroes_df=heroes_df,
-                split_teams=split_teams,
-                dtype=np.int8,
+            train_players_fold = filter_players_by_match_ids(
+                players_train,
+                train_matches["match_id"].to_numpy(),
             )
-            X_train_heroes = hero_encoder.fit_transform(
-                train_players_fold,
-                matches_df=train_matches[["match_id"]],
+            valid_players_fold = filter_players_by_match_ids(
+                players_train,
+                valid_matches["match_id"].to_numpy(),
             )
-            X_valid_heroes = hero_encoder.transform(
-                valid_players_fold,
-                matches_df=valid_matches[["match_id"]],
-            )
-            X_train_blocks.append(X_train_heroes)
-            X_valid_blocks.append(X_valid_heroes)
 
-        X_train = combine_feature_blocks(*X_train_blocks)
-        X_valid = combine_feature_blocks(*X_valid_blocks)
+        X_train, y_train, X_valid, y_valid = build_feature_matrices(
+            train_matches,
+            valid_matches,
+            cfg,
+            train_players=train_players_fold,
+            other_players=valid_players_fold,
+            use_tabular=use_tabular,
+            use_heroes=use_heroes,
+            heroes_df=heroes_df,
+            split_teams=split_teams,
+            target_col=target_col,
+        )
 
-        model = make_sparse_logreg()
+        model = make_logreg(model_params=model_params)
         model.fit(X_train, y_train)
 
         valid_pred = get_positive_class_proba(model, X_valid)
@@ -546,117 +541,54 @@ def cross_validate_feature_model(
     return mean_gini, fold_ginis
 
 
-def fit_full_model_and_predict(
+def fit_model_and_predict(
     df_train,
     df_test,
-    target_cols,
-    ohe_cols,
-    numeric_cols,
-    mmr_transform="raw",
-    target_col="radiant_win",
-):
-    df_train = to_pandas_df(df_train)
-    df_test = to_pandas_df(df_test)
-
-    df_train["date"] = pd.to_datetime(df_train["date"])
-    df_test["date"] = pd.to_datetime(df_test["date"])
-
-    df_train = df_train.sort_values("date").reset_index(drop=True)
-
-    df_train_prep, df_test_prep = preprocess_fold(
-        df_train,
-        df_test,
-        mmr_transform=mmr_transform,
-    )
-
-    feature_cols = unique_list(target_cols + ohe_cols + numeric_cols)
-
-    X_train, y_train = prepare_model_data(
-        df_train_prep,
-        feature_cols=feature_cols,
-        target_col=target_col,
-    )
-    X_test, _ = prepare_model_data(
-        df_test_prep,
-        feature_cols=feature_cols,
-        target_col=target_col,
-    )
-
-    model = make_pipeline(
-        target_cols=target_cols,
-        ohe_cols=ohe_cols,
-        numeric_cols=numeric_cols,
-    )
-    model.fit(X_train, y_train)
-
-    test_pred = get_positive_class_proba(model, X_test)
-
-    return model, test_pred
-
-def fit_feature_model_and_predict(
-    df_train,
-    df_test,
-    players_train,
-    players_test,
-    cfg,
+    cfg: FeatureConfig,
+    *,
+    players_train=None,
+    players_test=None,
     use_tabular=True,
-    use_heroes=True,
+    use_heroes=False,
     heroes_df=None,
     split_teams=True,
     target_col="radiant_win",
+    model_params=None,
 ):
     if not use_tabular and not use_heroes:
         raise ValueError("Нужно включить хотя бы один блок фичей")
 
     df_train = to_pandas_df(df_train)
     df_test = to_pandas_df(df_test)
-    players_train = to_polars_df(players_train)
-    players_test = to_polars_df(players_test)
+
+    if use_heroes:
+        players_train = to_polars_df(players_train)
+        players_test = to_polars_df(players_test)
 
     df_train["date"] = pd.to_datetime(df_train["date"])
     df_test["date"] = pd.to_datetime(df_test["date"])
     df_train = df_train.sort_values("date").reset_index(drop=True)
 
-    X_train_blocks = []
-    X_test_blocks = []
+    if use_heroes and players_test.height == 0:
+        warnings.warn("players_test пустой.")
 
-    if use_tabular:
-        _, X_train_tab, y_train, X_test_tab, _ = fit_tabular_feature_blocks(
-            df_train,
-            df_test,
-            cfg,
-            target_col=target_col,
-        )
-        X_train_blocks.append(X_train_tab)
-        X_test_blocks.append(X_test_tab)
-    else:
-        y_train = df_train[target_col].astype(int).to_numpy()
+    X_train, y_train, X_test, _ = build_feature_matrices(
+        df_train,
+        df_test,
+        cfg,
+        train_players=players_train,
+        other_players=players_test,
+        use_tabular=use_tabular,
+        use_heroes=use_heroes,
+        heroes_df=heroes_df,
+        split_teams=split_teams,
+        target_col=target_col,
+    )
 
-    if use_heroes:
-        hero_encoder = HeroesEncoder(
-            heroes_df=heroes_df,
-            split_teams=split_teams,
-            dtype=np.int8,
-        )
-        if players_test.height == 0:
-            warnings.warn("players_test пустой.")
-        X_train_heroes = hero_encoder.fit_transform(
-            players_train,
-            matches_df=df_train[["match_id"]],
-        )
-        X_test_heroes = hero_encoder.transform(
-            players_test,
-            matches_df=df_test[["match_id"]],
-        )
-        if not np.any(X_test_heroes):
-            warnings.warn("Фича героя для теста пустая.")
-        X_train_blocks.append(X_train_heroes)
-        X_test_blocks.append(X_test_heroes)
+    if use_heroes and not np.any(X_test):
+        warnings.warn("Фича героя для теста пустая.")
 
-    X_train = combine_feature_blocks(*X_train_blocks)
-    X_test = combine_feature_blocks(*X_test_blocks)
-
-    model = make_sparse_logreg()
+    model = make_logreg(model_params=model_params)
     model.fit(X_train, y_train)
 
     test_pred = get_positive_class_proba(model, X_test)
@@ -688,21 +620,6 @@ def save_test_predictions(df_test, test_pred, path="submission.csv", id_col="mat
     return submission
 
 
-def log_result(stage, config_name, cfg, mean_gini, fold_ginis, model_name="cuML LogisticRegression"):
-    global results_store
-    results_store.append({
-        "timestamp": datetime.now().isoformat(),
-        "stage": stage,
-        "model": model_name,
-        "features": config_name,
-        "target_cols": list(cfg.get("target_cols", [])),
-        "ohe_cols": list(cfg.get("ohe_cols", [])),
-        "numeric_cols": list(cfg.get("numeric_cols", [])),
-        "mmr_transform": cfg.get("mmr_transform", "raw"),
-        "fold_ginis": [round(float(x), 6) for x in fold_ginis],
-        "gini": round(float(mean_gini), 6),
-    })
-
 def prepare_players_for_run(players_train, players_test, df_train, df_test, preprocess_players=True):
     if not preprocess_players:
         return players_train, players_test
@@ -715,42 +632,40 @@ def prepare_players_for_run(players_train, players_test, df_train, df_test, prep
     return split_players_by_matches(players_all, df_train, df_test)
 
 
+def log_result(results_store, stage, config_name, cfg: FeatureConfig, mean_gini, fold_ginis, model_name="cuML LogisticRegression"):
+    results_store.append({
+        "timestamp": datetime.now().isoformat(),
+        "stage": stage,
+        "model": model_name,
+        "features": config_name,
+        "target_cols": list(cfg.target_cols),
+        "ohe_cols": list(cfg.ohe_cols),
+        "numeric_cols": list(cfg.numeric_cols),
+        "mmr_transform": cfg.mmr_transform,
+        "fold_ginis": [round(float(x), 6) for x in fold_ginis],
+        "gini": round(float(mean_gini), 6),
+    })
+
+
 def build_base_configs():
-    date_cols = ["month", "is_weekend"]
+    date_cols = ("month", "is_weekend")
     return {
-        # "dates": {
-        #     "target_cols": [],
-        #     "ohe_cols": date_cols,
-        #     "numeric_cols": [],
-        #     "mmr_transform": "raw",
-        # },
-        # "regions target encoding": {
-        #     "target_cols": ["region"],
-        #     "ohe_cols": [],
-        #     "numeric_cols": [],
-        #     "mmr_transform": "raw",
-        # },
-        # "regions OHE": {
-        #     "target_cols": [],
-        #     "ohe_cols": ["region"],
-        #     "numeric_cols": [],
-        #     "mmr_transform": "raw",
-        # },
-        "dates+regions (OHE)": {
-            "target_cols": [],
-            "ohe_cols": ["region"] + date_cols,
-            "numeric_cols": [],
-            "mmr_transform": "raw",
-        },
-        "all base (no mmr)": {
-            "target_cols": [],
-            "ohe_cols": ["game_mode", "region"] + date_cols,
-            "numeric_cols": [],
-            "mmr_transform": "raw",
-        },
+        "dates": FeatureConfig(
+            ohe_cols=date_cols,
+        ),
+        "regions": FeatureConfig(
+            ohe_cols=("region",),
+        ),
+        "dates+regions (OHE)": FeatureConfig(
+            ohe_cols=("region",) + date_cols,
+        ),
+        "all base (no mmr)": FeatureConfig(
+            ohe_cols=("game_mode", "region") + date_cols,
+        ),
     }
 
-def stage_base_search(df_train, n_splits, target_col, base_configs=None):
+
+def stage_base_search(df_train, n_splits, target_col, results_store, base_configs=None):
     base_configs = build_base_configs() if base_configs is None else base_configs
 
     best_base_name = None
@@ -763,17 +678,17 @@ def stage_base_search(df_train, n_splits, target_col, base_configs=None):
     for config_name, cfg in base_configs.items():
         print(f"\n{config_name}")
 
-        mean_gini, fold_ginis = cross_validate_model(
+        mean_gini, fold_ginis = cross_validate(
             df_train=df_train,
-            target_cols=cfg["target_cols"],
-            ohe_cols=cfg["ohe_cols"],
-            numeric_cols=cfg["numeric_cols"],
-            mmr_transform=cfg["mmr_transform"],
+            cfg=cfg,
+            use_tabular=True,
+            use_heroes=False,
             n_splits=n_splits,
             target_col=target_col,
         )
 
         log_result(
+            results_store=results_store,
             stage="base_search",
             config_name=config_name,
             cfg=cfg,
@@ -785,7 +700,7 @@ def stage_base_search(df_train, n_splits, target_col, base_configs=None):
         if mean_gini > best_base_gini:
             best_base_gini = mean_gini
             best_base_name = config_name
-            best_base_cfg = clone_config(cfg)
+            best_base_cfg = cfg
             best_base_fold_ginis = fold_ginis
 
     print(f"\nBest base config: {best_base_name}")
@@ -798,20 +713,17 @@ def stage_base_search(df_train, n_splits, target_col, base_configs=None):
         "best_base_fold_ginis": best_base_fold_ginis,
     }
 
+
 def stage_mmr_comparison(
     df_train,
-    best_base_name,
     best_base_cfg,
     transformed_mmr,
     n_splits,
     target_col,
+    results_store,
 ):
-    raw_mmr_cfg = add_mmr_to_config(best_base_cfg, mmr_transform="raw")
-    transformed_mmr_cfg = add_mmr_to_config(best_base_cfg, mmr_transform=transformed_mmr)
     comparison_configs = {
-        # f"base: {best_base_name}": clone_config(best_base_cfg),
-        # "base + raw avg_mmr + mmr_missing": raw_mmr_cfg,
-        f"base + {transformed_mmr} avg_mmr + mmr_missing": transformed_mmr_cfg,
+        f"base + {transformed_mmr} avg_mmr + mmr_missing": best_base_cfg.with_mmr(transformed_mmr),
     }
 
     comparison_scores = {}
@@ -820,12 +732,11 @@ def stage_mmr_comparison(
     for config_name, cfg in comparison_configs.items():
         print(f"\n{config_name}")
 
-        mean_gini, fold_ginis = cross_validate_model(
+        mean_gini, fold_ginis = cross_validate(
             df_train=df_train,
-            target_cols=cfg["target_cols"],
-            ohe_cols=cfg["ohe_cols"],
-            numeric_cols=cfg["numeric_cols"],
-            mmr_transform=cfg["mmr_transform"],
+            cfg=cfg,
+            use_tabular=True,
+            use_heroes=False,
             n_splits=n_splits,
             target_col=target_col,
         )
@@ -833,10 +744,11 @@ def stage_mmr_comparison(
         comparison_scores[config_name] = {
             "mean_gini": mean_gini,
             "fold_ginis": fold_ginis,
-            "cfg": clone_config(cfg),
+            "cfg": cfg,
         }
 
         log_result(
+            results_store=results_store,
             stage="mmr_comparison",
             config_name=config_name,
             cfg=cfg,
@@ -849,7 +761,7 @@ def stage_mmr_comparison(
         comparison_scores,
         key=lambda name: comparison_scores[name]["mean_gini"],
     )
-    best_tabular_cfg = clone_config(comparison_scores[best_tabular_name]["cfg"])
+    best_tabular_cfg = comparison_scores[best_tabular_name]["cfg"]
 
     print(f"\nBest tabular config after MMR comparison: {best_tabular_name}")
     print(f"Best tabular mean Gini: {comparison_scores[best_tabular_name]['mean_gini']:.5f}")
@@ -860,6 +772,7 @@ def stage_mmr_comparison(
         "comparison_scores": comparison_scores,
     }
 
+
 def stage_hero_models(
     df_train,
     players_train,
@@ -868,13 +781,9 @@ def stage_hero_models(
     n_splits,
     target_col,
     best_tabular_cfg,
+    results_store,
 ):
-    hero_only_cfg = {
-        "target_cols": [],
-        "ohe_cols": [],
-        "numeric_cols": [],
-        "mmr_transform": "raw",
-    }
+    hero_only_cfg = FeatureConfig()
 
     hero_model_specs = {
         "all features": {
@@ -895,10 +804,10 @@ def stage_hero_models(
     for config_name, spec in hero_model_specs.items():
         print(f"\n{config_name}")
 
-        mean_gini, fold_ginis = cross_validate_feature_model(
+        mean_gini, fold_ginis = cross_validate(
             df_train=df_train,
-            players_train=players_train,
             cfg=spec["cfg"],
+            players_train=players_train,
             use_tabular=spec["use_tabular"],
             use_heroes=spec["use_heroes"],
             heroes_df=heroes_df,
@@ -910,10 +819,11 @@ def stage_hero_models(
         hero_model_scores[config_name] = {
             "mean_gini": mean_gini,
             "fold_ginis": fold_ginis,
-            "cfg": clone_config(spec["cfg"]),
+            "cfg": spec["cfg"],
         }
 
         log_result(
+            results_store=results_store,
             stage="hero_models",
             config_name=config_name,
             cfg=spec["cfg"],
@@ -927,6 +837,7 @@ def stage_hero_models(
     print(f"Heroes only Gini: {hero_model_scores['heroes only']['mean_gini']:.5f}")
 
     return hero_only_cfg, hero_model_scores
+
 
 def stage_fit_hero_models_and_save(
     df_train,
@@ -943,7 +854,7 @@ def stage_fit_hero_models_and_save(
 ):
     print("\nStage 4: fit full hero models and save test submissions")
 
-    all_features_model, all_features_test_pred = fit_feature_model_and_predict(
+    all_features_model, all_features_test_pred = fit_model_and_predict(
         df_train=df_train,
         df_test=df_test,
         players_train=players_train,
@@ -956,7 +867,7 @@ def stage_fit_hero_models_and_save(
         target_col=target_col,
     )
 
-    heroes_only_model, heroes_only_test_pred = fit_feature_model_and_predict(
+    heroes_only_model, heroes_only_test_pred = fit_model_and_predict(
         df_train=df_train,
         df_test=df_test,
         players_train=players_train,
@@ -997,7 +908,8 @@ def stage_fit_hero_models_and_save(
         "heroes_only_submission_path": heroes_only_submission_path,
     }
 
-def stage_finalize_results(results_path):
+
+def stage_finalize_results(results_store, results_path):
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(results_store, f, indent=2, ensure_ascii=False)
 
@@ -1014,7 +926,6 @@ def stage_finalize_results(results_path):
     }
 
 
-
 def run(
     df_train,
     df_test,
@@ -1029,32 +940,28 @@ def run(
     transformed_mmr="sqrt",
     preprocess_players=True,
 ):
-    global results_store
     results_store = []
 
-    players_train, players_test = split_players_by_matches(players_df, df_train, df_test)
+    players_all = to_polars_df(players_df)
+    if preprocess_players:
+        players_all = preprocess_players_df(players_all)
 
-    players_train, players_test = prepare_players_for_run(
-        players_train,
-        players_test,
-        df_train,
-        df_test,
-        preprocess_players=preprocess_players,
-    )
+    players_train, players_test = split_players_by_matches(players_all, df_train, df_test)
 
     base_results = stage_base_search(
         df_train=df_train,
         n_splits=n_splits,
         target_col=target_col,
+        results_store=results_store,
     )
 
     mmr_results = stage_mmr_comparison(
         df_train=df_train,
-        best_base_name=base_results["best_base_name"],
         best_base_cfg=base_results["best_base_cfg"],
         transformed_mmr=transformed_mmr,
         n_splits=n_splits,
         target_col=target_col,
+        results_store=results_store,
     )
 
     hero_only_cfg, hero_model_scores = stage_hero_models(
@@ -1065,6 +972,7 @@ def run(
         n_splits=n_splits,
         target_col=target_col,
         best_tabular_cfg=mmr_results["best_tabular_cfg"],
+        results_store=results_store,
     )
 
     fit_results = stage_fit_hero_models_and_save(
@@ -1081,7 +989,10 @@ def run(
         submission_id_col=submission_id_col,
     )
 
-    finalize_results = stage_finalize_results(results_path)
+    finalize_results = stage_finalize_results(
+        results_store=results_store,
+        results_path=results_path,
+    )
 
     return {
         "best_base_config": base_results["best_base_name"],
@@ -1104,3 +1015,4 @@ def run(
         "hero_model_results": finalize_results["hero_model_results"],
         "cv_results": finalize_results["cv_results"],
     }
+

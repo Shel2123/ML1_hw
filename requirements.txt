@@ -10,3 +10,4 @@ cuml
 cudf
 category-encoders
 optuna
+joblib
