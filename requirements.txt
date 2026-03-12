@@ -11,3 +11,5 @@ cudf
 category-encoders
 optuna
 joblib
+pymystem3
+wordcloud
