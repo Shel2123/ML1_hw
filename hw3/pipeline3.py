@@ -8,6 +8,7 @@ from functools import lru_cache
 
 import cudf
 import numpy as np
+import polars as pl
 import cupy as cp
 import pandas as pd
 import category_encoders as ce
@@ -77,6 +78,13 @@ def to_pandas_df(df):
             return out.to_frame().copy()
         return out.copy()
     return pd.DataFrame(df).copy()
+
+def to_polars_df(df):
+    if isinstance(df, pl.DataFrame):
+        return df
+    if isinstance(df, pd.DataFrame):
+        return pl.from_pandas(df)
+    raise TypeError("Unsupported dataframe type")
 
 
 def to_gpu_dense(x, dtype=cp.float32):
@@ -937,354 +945,376 @@ def build_base_configs():
     }
 
 
-# def stage_base_search(df_train, n_splits, target_col, results_store, base_configs=None):
-#     base_configs = build_base_configs() if base_configs is None else base_configs
-#
-#     best_base_name = None
-#     best_base_cfg = None
-#     best_base_gini = -np.inf
-#     best_base_fold_ginis = None
-#
-#     print("\nStage 1: search best base config without avg_mmr")
-#
-#     for config_name, cfg in base_configs.items():
-#         print(f"\n{config_name}")
-#
-#         mean_gini, fold_ginis = cross_validate(
-#             df_train=df_train,
-#             cfg=cfg,
-#             use_tabular=True,
-#             use_heroes=False,
-#             n_splits=n_splits,
-#             target_col=target_col,
-#         )
-#
-#         log_result(
-#             results_store=results_store,
-#             stage="base_search",
-#             config_name=config_name,
-#             cfg=cfg,
-#             mean_gini=mean_gini,
-#             fold_ginis=fold_ginis,
-#             model_name="cuML LogisticRegression",
-#         )
-#
-#         if mean_gini > best_base_gini:
-#             best_base_gini = mean_gini
-#             best_base_name = config_name
-#             best_base_cfg = cfg
-#             best_base_fold_ginis = fold_ginis
-#
-#     print(f"\nBest base config: {best_base_name}")
-#     print(f"Best base mean Gini: {best_base_gini:.5f}")
-#
-#     return {
-#         "best_base_name": best_base_name,
-#         "best_base_cfg": best_base_cfg,
-#         "best_base_gini": best_base_gini,
-#         "best_base_fold_ginis": best_base_fold_ginis,
-#     }
+def stage_base_search(df_train, n_splits, target_col, results_store, base_configs=None):
+    base_configs = build_base_configs() if base_configs is None else base_configs
+
+    best_base_name = None
+    best_base_cfg = None
+    best_base_gini = -np.inf
+    best_base_fold_ginis = None
+
+    print("\nStage 1: search best base config without avg_mmr")
+
+    for config_name, cfg in base_configs.items():
+        print(f"\n{config_name}")
+
+        mean_gini, fold_ginis = cross_validate(
+            df_train=df_train,
+            cfg=cfg,
+            use_tabular=True,
+            use_heroes=False,
+            n_splits=n_splits,
+            target_col=target_col,
+        )
+
+        log_result(
+            results_store=results_store,
+            stage="base_search",
+            config_name=config_name,
+            cfg=cfg,
+            mean_gini=mean_gini,
+            fold_ginis=fold_ginis,
+            model_name="cuML LogisticRegression",
+        )
+
+        if mean_gini > best_base_gini:
+            best_base_gini = mean_gini
+            best_base_name = config_name
+            best_base_cfg = cfg
+            best_base_fold_ginis = fold_ginis
+
+    print(f"\nBest base config: {best_base_name}")
+    print(f"Best base mean Gini: {best_base_gini:.5f}")
+
+    return {
+        "best_base_name": best_base_name,
+        "best_base_cfg": best_base_cfg,
+        "best_base_gini": best_base_gini,
+        "best_base_fold_ginis": best_base_fold_ginis,
+    }
 
 
-# def stage_mmr_comparison(
-#     df_train,
-#     best_base_cfg,
-#     transformed_mmr,
-#     n_splits,
-#     target_col,
-#     results_store,
-# ):
-#     comparison_configs = {
-#         f"base + {transformed_mmr} avg_mmr + mmr_missing": best_base_cfg.with_mmr(transformed_mmr),
-#     }
-#
-#     comparison_scores = {}
-#     print("\nStage 2: compare base vs new MMR models")
-#
-#     for config_name, cfg in comparison_configs.items():
-#         print(f"\n{config_name}")
-#
-#         mean_gini, fold_ginis = cross_validate(
-#             df_train=df_train,
-#             cfg=cfg,
-#             use_tabular=True,
-#             use_heroes=False,
-#             n_splits=n_splits,
-#             target_col=target_col,
-#         )
-#
-#         comparison_scores[config_name] = {
-#             "mean_gini": mean_gini,
-#             "fold_ginis": fold_ginis,
-#             "cfg": cfg,
-#         }
-#
-#         log_result(
-#             results_store=results_store,
-#             stage="mmr_comparison",
-#             config_name=config_name,
-#             cfg=cfg,
-#             mean_gini=mean_gini,
-#             fold_ginis=fold_ginis,
-#             model_name="cuML LogisticRegression",
-#         )
-#
-#     best_tabular_name = max(
-#         comparison_scores,
-#         key=lambda name: comparison_scores[name]["mean_gini"],
-#     )
-#     best_tabular_cfg = comparison_scores[best_tabular_name]["cfg"]
-#
-#     print(f"\nBest tabular config after MMR comparison: {best_tabular_name}")
-#     print(f"Best tabular mean Gini: {comparison_scores[best_tabular_name]['mean_gini']:.5f}")
-#
-#     return {
-#         "best_tabular_name": best_tabular_name,
-#         "best_tabular_cfg": best_tabular_cfg,
-#         "comparison_scores": comparison_scores,
-#     }
+def stage_mmr_comparison(
+    df_train,
+    best_base_cfg,
+    transformed_mmr,
+    n_splits,
+    target_col,
+    results_store,
+):
+    comparison_configs = {
+        f"base + {transformed_mmr} avg_mmr + mmr_missing": best_base_cfg.with_mmr(transformed_mmr),
+    }
+
+    comparison_scores = {}
+    print("\nStage 2: compare base vs new MMR models")
+
+    for config_name, cfg in comparison_configs.items():
+        print(f"\n{config_name}")
+
+        mean_gini, fold_ginis = cross_validate(
+            df_train=df_train,
+            cfg=cfg,
+            use_tabular=True,
+            use_heroes=False,
+            n_splits=n_splits,
+            target_col=target_col,
+        )
+
+        comparison_scores[config_name] = {
+            "mean_gini": mean_gini,
+            "fold_ginis": fold_ginis,
+            "cfg": cfg,
+        }
+
+        log_result(
+            results_store=results_store,
+            stage="mmr_comparison",
+            config_name=config_name,
+            cfg=cfg,
+            mean_gini=mean_gini,
+            fold_ginis=fold_ginis,
+            model_name="cuML LogisticRegression",
+        )
+
+    best_tabular_name = max(
+        comparison_scores,
+        key=lambda name: comparison_scores[name]["mean_gini"],
+    )
+    best_tabular_cfg = comparison_scores[best_tabular_name]["cfg"]
+
+    print(f"\nBest tabular config after MMR comparison: {best_tabular_name}")
+    print(f"Best tabular mean Gini: {comparison_scores[best_tabular_name]['mean_gini']:.5f}")
+
+    return {
+        "best_tabular_name": best_tabular_name,
+        "best_tabular_cfg": best_tabular_cfg,
+        "comparison_scores": comparison_scores,
+    }
 
 
-# def stage_hero_models(
-#     df_train,
-#     players_train,
-#     heroes_df,
-#     split_teams,
-#     n_splits,
-#     target_col,
-#     best_tabular_cfg,
-#     results_store,
-# ):
-#     hero_only_cfg = FeatureConfig()
-#
-#     hero_model_specs = {
-#         "all features": {
-#             "cfg": best_tabular_cfg,
-#             "use_tabular": True,
-#             "use_heroes": True,
-#         },
-#         "heroes only": {
-#             "cfg": hero_only_cfg,
-#             "use_tabular": False,
-#             "use_heroes": True,
-#         },
-#     }
-#
-#     hero_model_scores = {}
-#     print("\nStage 3: compare hero-based models")
-#
-#     for config_name, spec in hero_model_specs.items():
-#         print(f"\n{config_name}")
-#
-#         mean_gini, fold_ginis = cross_validate(
-#             df_train=df_train,
-#             cfg=spec["cfg"],
-#             players_train=players_train,
-#             use_tabular=spec["use_tabular"],
-#             use_heroes=spec["use_heroes"],
-#             heroes_df=heroes_df,
-#             split_teams=split_teams,
-#             n_splits=n_splits,
-#             target_col=target_col,
-#         )
-#
-#         hero_model_scores[config_name] = {
-#             "mean_gini": mean_gini,
-#             "fold_ginis": fold_ginis,
-#             "cfg": spec["cfg"],
-#         }
-#
-#         log_result(
-#             results_store=results_store,
-#             stage="hero_models",
-#             config_name=config_name,
-#             cfg=spec["cfg"],
-#             mean_gini=mean_gini,
-#             fold_ginis=fold_ginis,
-#             model_name="cuml logistic regression with heroes",
-#         )
-#
-#     print("\nHero models comparison (CV)")
-#     print(f"All features Gini: {hero_model_scores['all features']['mean_gini']:.5f}")
-#     print(f"Heroes only Gini: {hero_model_scores['heroes only']['mean_gini']:.5f}")
-#
-#     return hero_only_cfg, hero_model_scores
+def stage_hero_models(
+    df_train,
+    players_train,
+    heroes_df,
+    split_teams,
+    n_splits,
+    target_col,
+    best_tabular_cfg,
+    results_store,
+):
+    hero_only_cfg = FeatureConfig()
+
+    hero_model_specs = {
+        "all features": {
+            "cfg": best_tabular_cfg,
+            "use_tabular": True,
+            "use_heroes": True,
+        },
+        "heroes only": {
+            "cfg": hero_only_cfg,
+            "use_tabular": False,
+            "use_heroes": True,
+        },
+    }
+
+    hero_model_scores = {}
+    print("\nStage 3: compare hero-based models")
+
+    for config_name, spec in hero_model_specs.items():
+        print(f"\n{config_name}")
+
+        mean_gini, fold_ginis = cross_validate(
+            df_train=df_train,
+            cfg=spec["cfg"],
+            players_train=players_train,
+            use_tabular=spec["use_tabular"],
+            use_heroes=spec["use_heroes"],
+            heroes_df=heroes_df,
+            split_teams=split_teams,
+            n_splits=n_splits,
+            target_col=target_col,
+        )
+
+        hero_model_scores[config_name] = {
+            "mean_gini": mean_gini,
+            "fold_ginis": fold_ginis,
+            "cfg": spec["cfg"],
+        }
+
+        log_result(
+            results_store=results_store,
+            stage="hero_models",
+            config_name=config_name,
+            cfg=spec["cfg"],
+            mean_gini=mean_gini,
+            fold_ginis=fold_ginis,
+            model_name="cuml logistic regression with heroes",
+        )
+
+    print("\nHero models comparison (CV)")
+    print(f"All features Gini: {hero_model_scores['all features']['mean_gini']:.5f}")
+    print(f"Heroes only Gini: {hero_model_scores['heroes only']['mean_gini']:.5f}")
+
+    return hero_only_cfg, hero_model_scores
 
 
-# def stage_fit_hero_models_and_save(
-#     df_train,
-#     df_test,
-#     players_train,
-#     players_test,
-#     best_tabular_cfg,
-#     hero_only_cfg,
-#     heroes_df,
-#     split_teams,
-#     target_col,
-#     submission_path,
-#     submission_id_col,
-# ):
-#     print("\nStage 4: fit full hero models and save test submissions")
-#
-#     all_features_model, all_features_test_pred = fit_model_and_predict(
-#         df_train=df_train,
-#         df_test=df_test,
-#         players_train=players_train,
-#         players_test=players_test,
-#         cfg=best_tabular_cfg,
-#         use_tabular=True,
-#         use_heroes=True,
-#         heroes_df=heroes_df,
-#         split_teams=split_teams,
-#         target_col=target_col,
-#     )
-#
-#     heroes_only_model, heroes_only_test_pred = fit_model_and_predict(
-#         df_train=df_train,
-#         df_test=df_test,
-#         players_train=players_train,
-#         players_test=players_test,
-#         cfg=hero_only_cfg,
-#         use_tabular=False,
-#         use_heroes=True,
-#         heroes_df=heroes_df,
-#         split_teams=split_teams,
-#         target_col=target_col,
-#     )
-#
-#     all_features_submission_path = make_submission_path(submission_path, "all_features")
-#     heroes_only_submission_path = make_submission_path(submission_path, "heroes_only")
-#
-#     all_features_submission = save_test_predictions(
-#         df_test=df_test,
-#         test_pred=all_features_test_pred,
-#         path=all_features_submission_path,
-#         id_col=submission_id_col,
-#     )
-#
-#     heroes_only_submission = save_test_predictions(
-#         df_test=df_test,
-#         test_pred=heroes_only_test_pred,
-#         path=heroes_only_submission_path,
-#         id_col=submission_id_col,
-#     )
-#
-#     return {
-#         "all_features_model": all_features_model,
-#         "all_features_test_pred": all_features_test_pred,
-#         "all_features_submission": all_features_submission,
-#         "all_features_submission_path": all_features_submission_path,
-#         "heroes_only_model": heroes_only_model,
-#         "heroes_only_test_pred": heroes_only_test_pred,
-#         "heroes_only_submission": heroes_only_submission,
-#         "heroes_only_submission_path": heroes_only_submission_path,
-#     }
+def stage_fit_hero_models_and_save(
+    df_train,
+    df_test,
+    players_train,
+    players_test,
+    best_tabular_cfg,
+    hero_only_cfg,
+    heroes_df,
+    split_teams,
+    target_col,
+    submission_path,
+    submission_id_col,
+):
+    print("\nStage 4: fit full hero models and save test submissions")
+
+    all_features_model, all_features_test_pred = fit_model_and_predict(
+        df_train=df_train,
+        df_test=df_test,
+        players_train=players_train,
+        players_test=players_test,
+        cfg=best_tabular_cfg,
+        use_tabular=True,
+        use_heroes=True,
+        heroes_df=heroes_df,
+        split_teams=split_teams,
+        target_col=target_col,
+    )
+
+    heroes_only_model, heroes_only_test_pred = fit_model_and_predict(
+        df_train=df_train,
+        df_test=df_test,
+        players_train=players_train,
+        players_test=players_test,
+        cfg=hero_only_cfg,
+        use_tabular=False,
+        use_heroes=True,
+        heroes_df=heroes_df,
+        split_teams=split_teams,
+        target_col=target_col,
+    )
+
+    all_features_submission_path = make_submission_path(submission_path, "all_features")
+    heroes_only_submission_path = make_submission_path(submission_path, "heroes_only")
+
+    all_features_submission = save_test_predictions(
+        df_test=df_test,
+        test_pred=all_features_test_pred,
+        path=all_features_submission_path,
+        id_col=submission_id_col,
+    )
+
+    heroes_only_submission = save_test_predictions(
+        df_test=df_test,
+        test_pred=heroes_only_test_pred,
+        path=heroes_only_submission_path,
+        id_col=submission_id_col,
+    )
+
+    return {
+        "all_features_model": all_features_model,
+        "all_features_test_pred": all_features_test_pred,
+        "all_features_submission": all_features_submission,
+        "all_features_submission_path": all_features_submission_path,
+        "heroes_only_model": heroes_only_model,
+        "heroes_only_test_pred": heroes_only_test_pred,
+        "heroes_only_submission": heroes_only_submission,
+        "heroes_only_submission_path": heroes_only_submission_path,
+    }
 
 
-# def stage_finalize_results(results_store, results_path):
-#     with open(results_path, "w", encoding="utf-8") as f:
-#         json.dump(results_store, f, indent=2, ensure_ascii=False)
-#
-#     cv_results = pd.DataFrame(results_store)
-#     base_search_results = cv_results[cv_results["stage"] == "base_search"].reset_index(drop=True)
-#     mmr_comparison_results = cv_results[cv_results["stage"] == "mmr_comparison"].reset_index(drop=True)
-#     hero_model_results = cv_results[cv_results["stage"] == "hero_models"].reset_index(drop=True)
-#
-#     return {
-#         "cv_results": cv_results,
-#         "base_search_results": base_search_results,
-#         "mmr_comparison_results": mmr_comparison_results,
-#         "hero_model_results": hero_model_results,
-#     }
+def stage_finalize_results(results_store, results_path):
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results_store, f, indent=2, ensure_ascii=False)
+
+    cv_results = pd.DataFrame(results_store)
+    base_search_results = cv_results[cv_results["stage"] == "base_search"].reset_index(drop=True)
+    mmr_comparison_results = cv_results[cv_results["stage"] == "mmr_comparison"].reset_index(drop=True)
+    hero_model_results = cv_results[cv_results["stage"] == "hero_models"].reset_index(drop=True)
+
+    return {
+        "cv_results": cv_results,
+        "base_search_results": base_search_results,
+        "mmr_comparison_results": mmr_comparison_results,
+        "hero_model_results": hero_model_results,
+    }
 
 
-# def run(
-#     df_train,
-#     df_test,
-#     players_df,
-#     heroes_df=None,
-#     split_teams=True,
-#     n_splits=5,
-#     results_path="results.json",
-#     submission_path="submission.csv",
-#     submission_id_col="match_id",
-#     target_col="radiant_win",
-#     transformed_mmr="sqrt",
-#     preprocess_players=True,
-# ):
-#     results_store = []
-#
-#     players_all = to_polars_df(players_df)
-#     if preprocess_players:
-#         players_all = preprocess_players_df(players_all)
-#
-#     players_train, players_test = split_players_by_matches(players_all, df_train, df_test)
-#
-#     base_results = stage_base_search(
-#         df_train=df_train,
-#         n_splits=n_splits,
-#         target_col=target_col,
-#         results_store=results_store,
-#     )
-#
-#     mmr_results = stage_mmr_comparison(
-#         df_train=df_train,
-#         best_base_cfg=base_results["best_base_cfg"],
-#         transformed_mmr=transformed_mmr,
-#         n_splits=n_splits,
-#         target_col=target_col,
-#         results_store=results_store,
-#     )
-#
-#     hero_only_cfg, hero_model_scores = stage_hero_models(
-#         df_train=df_train,
-#         players_train=players_train,
-#         heroes_df=heroes_df,
-#         split_teams=split_teams,
-#         n_splits=n_splits,
-#         target_col=target_col,
-#         best_tabular_cfg=mmr_results["best_tabular_cfg"],
-#         results_store=results_store,
-#     )
-#
-#     fit_results = stage_fit_hero_models_and_save(
-#         df_train=df_train,
-#         df_test=df_test,
-#         players_train=players_train,
-#         players_test=players_test,
-#         best_tabular_cfg=mmr_results["best_tabular_cfg"],
-#         hero_only_cfg=hero_only_cfg,
-#         heroes_df=heroes_df,
-#         split_teams=split_teams,
-#         target_col=target_col,
-#         submission_path=submission_path,
-#         submission_id_col=submission_id_col,
-#     )
-#
-#     finalize_results = stage_finalize_results(
-#         results_store=results_store,
-#         results_path=results_path,
-#     )
-#
-#     return {
-#         "best_base_config": base_results["best_base_name"],
-#         "best_base_params": base_results["best_base_cfg"],
-#         "best_base_gini": base_results["best_base_gini"],
-#         "best_base_fold_ginis": base_results["best_base_fold_ginis"],
-#         "best_tabular_config_name": mmr_results["best_tabular_name"],
-#         "best_tabular_params": mmr_results["best_tabular_cfg"],
-#         "hero_model_scores": hero_model_scores,
-#         "all_features_model": fit_results["all_features_model"],
-#         "all_features_test_pred": fit_results["all_features_test_pred"],
-#         "all_features_submission": fit_results["all_features_submission"],
-#         "all_features_submission_path": fit_results["all_features_submission_path"],
-#         "heroes_only_model": fit_results["heroes_only_model"],
-#         "heroes_only_test_pred": fit_results["heroes_only_test_pred"],
-#         "heroes_only_submission": fit_results["heroes_only_submission"],
-#         "heroes_only_submission_path": fit_results["heroes_only_submission_path"],
-#         "base_search_results": finalize_results["base_search_results"],
-#         "mmr_comparison_results": finalize_results["mmr_comparison_results"],
-#         "hero_model_results": finalize_results["hero_model_results"],
-#         "cv_results": finalize_results["cv_results"],
-#     }
-#
+def run(
+    df_train,
+    df_test,
+    players_df=None,
+    heroes_df=None,
+    split_teams=True,
+    n_splits=5,
+    results_path="results.json",
+    submission_path="submission.csv",
+    submission_id_col="match_id",
+    target_col="radiant_win",
+    transformed_mmr="sqrt",
+    preprocess_players=True,
+):
+    results_store = []
+    if players_df is not None:
+        players_all = to_polars_df(players_df)
+    if preprocess_players and players_df is not None:
+        players_all = preprocess_players_df(players_all)
+    if players_df is not None:
+        players_train, players_test = split_players_by_matches(players_all, df_train, df_test)
+
+    base_results = stage_base_search(
+        df_train=df_train,
+        n_splits=n_splits,
+        target_col=target_col,
+        results_store=results_store,
+    )
+
+    mmr_results = stage_mmr_comparison(
+        df_train=df_train,
+        best_base_cfg=base_results["best_base_cfg"],
+        transformed_mmr=transformed_mmr,
+        n_splits=n_splits,
+        target_col=target_col,
+        results_store=results_store,
+    )
+    if players_df is not None:
+        hero_only_cfg, hero_model_scores = stage_hero_models(
+            df_train=df_train,
+            players_train=players_train,
+            heroes_df=heroes_df,
+            split_teams=split_teams,
+            n_splits=n_splits,
+            target_col=target_col,
+            best_tabular_cfg=mmr_results["best_tabular_cfg"],
+            results_store=results_store,
+        )
+
+        fit_results = stage_fit_hero_models_and_save(
+            df_train=df_train,
+            df_test=df_test,
+            players_train=players_train,
+            players_test=players_test,
+            best_tabular_cfg=mmr_results["best_tabular_cfg"],
+            hero_only_cfg=hero_only_cfg,
+            heroes_df=heroes_df,
+            split_teams=split_teams,
+            target_col=target_col,
+            submission_path=submission_path,
+            submission_id_col=submission_id_col,
+        )
+    else:
+        hero_model_scores = {}
+        fit_results = {}
+        all_features_model, all_features_test_pred = fit_model_and_predict(
+            df_train=df_train,
+            df_test=df_test,
+            cfg=mmr_results["best_tabular_cfg"],
+            use_tabular=True,
+            use_heroes=True,
+            heroes_df=heroes_df,
+            split_teams=split_teams,
+            target_col=target_col,
+        )
+        all_features_submission_path = make_submission_path(submission_path, "all_features")
+
+        all_features_submission = save_test_predictions(
+            df_test=df_test,
+            test_pred=all_features_test_pred,
+            path=all_features_submission_path,
+            id_col=submission_id_col,
+        )
+
+    finalize_results = stage_finalize_results(
+        results_store=results_store,
+        results_path=results_path,
+    )
+
+
+    return {
+        "best_base_config": base_results["best_base_name"],
+        "best_base_params": base_results["best_base_cfg"],
+        "best_base_gini": base_results["best_base_gini"],
+        "best_base_fold_ginis": base_results["best_base_fold_ginis"],
+        "best_tabular_config_name": mmr_results["best_tabular_name"],
+        "best_tabular_params": mmr_results["best_tabular_cfg"],
+        # "hero_model_scores": hero_model_scores,
+        # "all_features_model": fit_results["all_features_model"],
+        # "all_features_test_pred": fit_results["all_features_test_pred"],
+        # "all_features_submission": fit_results["all_features_submission"],
+        # "all_features_submission_path": fit_results["all_features_submission_path"],
+        # "heroes_only_model": fit_results["heroes_only_model"],
+        # "heroes_only_test_pred": fit_results["heroes_only_test_pred"],
+        # "heroes_only_submission": fit_results["heroes_only_submission"],
+        # "heroes_only_submission_path": fit_results["heroes_only_submission_path"],
+        "base_search_results": finalize_results["base_search_results"],
+        "mmr_comparison_results": finalize_results["mmr_comparison_results"],
+        # "hero_model_results": finalize_results["hero_model_results"],
+        "cv_results": finalize_results["cv_results"],
+    }
+

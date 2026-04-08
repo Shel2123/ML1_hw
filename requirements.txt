@@ -13,3 +13,6 @@ optuna
 joblib
 pymystem3
 wordcloud
+torch
+ipython
+librosa
