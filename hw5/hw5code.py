@@ -2,7 +2,9 @@ import numpy as np
 from collections import Counter
 
 
-def find_best_split(feature_vector, target_vector):
+def find_best_split(
+        feature_vector: np.ndarray | list, target_vector: np.ndarray| list
+) -> tuple[np.ndarray, np.ndarray, float | None, float | None]:
     """
     Указания:
     * Пороги, приводящие к попаданию в одно из поддеревьев пустого множества объектов, не рассматриваются.
@@ -20,9 +22,53 @@ def find_best_split(feature_vector, target_vector):
     :return threshold_best: оптимальный порог (число)
     :return gini_best: оптимальное значение критерия Джини (число)
     """
-    # ╰( ͡° ͜ʖ ͡° )つ──☆*:・ﾟ
+    x = np.array(feature_vector)
+    y = np.array(target_vector)
+    if not np.all((y == 0) | (y == 1)):
+        raise ValueError("target_vector consists of more than 2 classes")
 
-    pass
+    thresholds = np.array([])
+    ginis = np.array([])
+    threshold_best = None
+    gini_best = None
+
+    order = x.argsort()
+    x_sorted = x[order]
+    y_sorted = y[order]
+
+    n = len(x_sorted)
+
+    diff = x_sorted[1:] != x_sorted[:-1]
+    valid_idx = np.where(diff)[0]
+
+    if len(valid_idx) <= 0:
+        return thresholds, ginis, threshold_best, gini_best
+
+    thresholds = (x_sorted[valid_idx] + x_sorted[valid_idx + 1]) / 2
+    y_cumsum = np.cumsum(y_sorted)
+
+    total_ones = y_cumsum[-1]
+    left_ones = y_cumsum[valid_idx]
+    right_ones = total_ones - left_ones
+
+    left_size = valid_idx + 1
+    right_size = n - left_size
+
+    p1_left = left_ones / left_size
+    p0_left = 1 - p1_left
+
+    p1_right = right_ones / right_size
+    p0_right = 1 - p1_right
+
+    gini_left = 1 - p1_left ** 2 - p0_left ** 2
+    gini_right = 1 - p1_right ** 2 - p0_right ** 2
+    ginis = - (left_size / n) * gini_left - (right_size / n) * gini_right
+
+    best_idx = np.argmax(ginis)
+    threshold_best = thresholds[best_idx]
+    gini_best = ginis[best_idx]
+
+    return thresholds, ginis, threshold_best, gini_best
 
 
 class DecisionTree:
