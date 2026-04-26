@@ -82,6 +82,9 @@ class DecisionTree:
     Их нужно исправить в рамках задания.
     """
     def __init__(self, feature_types, max_depth=None, min_samples_split=None, min_samples_leaf=None):
+        self._int_to_class = None
+        self._class_to_int = None
+        self._classes = None
         if np.any(list(map(lambda x: x != "real" and x != "categorical", feature_types))):
             raise ValueError("There is unknown feature type")
 
@@ -91,11 +94,19 @@ class DecisionTree:
         self._min_samples_split = min_samples_split
         self._min_samples_leaf = min_samples_leaf
 
-    def _fit_node(self, sub_X, sub_y, node):
+    def _fit_node(self, sub_X, sub_y, node, depth=0):
         if np.all(sub_y == sub_y[0]):
-            node["type"] = "terminal"
-            node["class"] = sub_y[0]
+            self._make_terminal(sub_y, node)
             return
+
+        if self._max_depth is not None and depth >= self._max_depth:
+            self._make_terminal(sub_y, node)
+            return
+
+        if self._min_samples_split is not None and len(sub_y) < self._min_samples_split:
+            self._make_terminal(sub_y, node)
+            return
+
 
         feature_best, threshold_best, gini_best, split = None, None, None, None
         for feature in range(sub_X.shape[1]):
@@ -125,10 +136,18 @@ class DecisionTree:
                 continue
 
             _, _, threshold, gini = find_best_split(feature_vector, sub_y)
+            current_split = feature_vector < threshold
+
+            if self._min_samples_leaf is not None:
+                if np.sum(current_split) < self._min_samples_leaf:
+                    continue
+                if np.sum(~current_split) < self._min_samples_leaf:
+                    continue
+
             if gini_best is None or gini > gini_best:
                 feature_best = feature
                 gini_best = gini
-                split = feature_vector < threshold
+                split = current_split
 
                 if feature_type == "real":
                     threshold_best = threshold
@@ -153,8 +172,8 @@ class DecisionTree:
         else:
             raise ValueError
         node["left_child"], node["right_child"] = {}, {}
-        self._fit_node(sub_X[split], sub_y[split], node["left_child"])
-        self._fit_node(sub_X[np.logical_not(split)], sub_y[np.logical_not(split)], node["right_child"])
+        self._fit_node(sub_X[split], sub_y[split], node["left_child"], depth + 1)
+        self._fit_node(sub_X[np.logical_not(split)], sub_y[np.logical_not(split)], node["right_child"], depth + 1)
 
     def _predict_node(self, x, node):
         if node["type"] == "terminal":
@@ -179,10 +198,35 @@ class DecisionTree:
             raise ValueError("Unknown feature type")
 
     def fit(self, X, y):
-        self._fit_node(X, y, self._tree)
+        y = np.array(y)
+        if hasattr(X, "to_numpy"):
+            X = X.to_numpy()
+        else:
+            X = np.array(X)
+
+        self._classes = np.unique(y)
+        if len(self._classes) != 2:
+            raise ValueError("Only binary classification supported")
+
+        self._class_to_int = {c: i for i, c in enumerate(self._classes)}
+        self._int_to_class = {i: c for c, i in self._class_to_int.items()}
+
+        y_encoded = np.array([self._class_to_int[c] for c in y])
+        self._fit_node(X, y_encoded, self._tree)
 
     def predict(self, X):
+        if hasattr(X, "to_numpy"):
+            X = X.to_numpy()
+        else:
+            X = np.array(X)
+
         predicted = []
         for x in X:
-            predicted.append(self._predict_node(x, self._tree))
+            prediction = self._predict_node(x, self._tree)
+            predicted.append(self._int_to_class[prediction])
         return np.array(predicted)
+
+    @staticmethod
+    def _make_terminal(sub_y, node):
+        node["type"] = "terminal"
+        node["class"] = Counter(sub_y).most_common(1)[0][0]

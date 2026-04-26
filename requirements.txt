@@ -16,3 +16,4 @@ wordcloud
 torch
 ipython
 librosa
+ucimlrepo
